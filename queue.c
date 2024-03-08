@@ -12,7 +12,7 @@ typedef struct Node {
 typedef struct WaitNode {
     cnd_t cond;
     struct WaitNode* next;
-    bool isSignaled;  // To ensure the thread should proceed.
+    bool isSignaled;
 } WaitNode;
 
 typedef struct {
@@ -46,12 +46,11 @@ void destroyQueue(void) {
         queue.head = queue.head->next;
         free(tmp);
     }
+
     while (queue.waitHead) {
         WaitNode* tmp = queue.waitHead;
         queue.waitHead = queue.waitHead->next;
-        if (!tmp->isSignaled) {
-            cnd_signal(&tmp->cond);  // Prevent any thread from being stuck.
-        }
+        cnd_signal(&tmp->cond);  // Ensure to signal all waiting threads.
         cnd_destroy(&tmp->cond);
         free(tmp);
     }
@@ -74,8 +73,14 @@ void enqueue(void* item) {
     atomic_fetch_add(&queue.size, 1);
 
     if (queue.waitHead) {
-        queue.waitHead->isSignaled = true;
-        cnd_signal(&queue.waitHead->cond);
+        WaitNode* waitNode = queue.waitHead;
+        waitNode->isSignaled = true;
+        cnd_signal(&waitNode->cond);
+        queue.waitHead = waitNode->next;  // Remove the node from the waiting queue.
+        if (queue.waitHead == NULL) {
+            queue.waitTail = NULL;
+        }
+        free(waitNode);
     }
 
     mtx_unlock(&queue.lock);
@@ -102,20 +107,26 @@ void* dequeue(void) {
             cnd_wait(&newWaitNode->cond, &queue.lock);
         }
         atomic_fetch_sub(&queue.waiting, 1);
+
+        // After waking up, check if the queue has become non-empty.
+        if (queue.head) {
+            break;
+        }
     }
 
     Node* node = queue.head;
-    queue.head = node->next;
-    if (!queue.head) queue.tail = NULL;
+    if (node) {  // Make sure the queue is not empty.
+        queue.head = node->next;
+        if (!queue.head) {
+            queue.tail = NULL;
+        }
+    }
 
-    void* item = node->data;
-    free(node);
-    atomic_fetch_sub(&queue.size, 1);
-    atomic_fetch_add(&queue.visited, 1);
-
-    if (queue.waitHead && !queue.head) {  // If the queue is empty and there are waiting threads
-        queue.waitHead->isSignaled = true;
-        cnd_signal(&queue.waitHead->cond);
+    void* item = node ? node->data : NULL;
+    if (node) {
+        free(node);
+        atomic_fetch_sub(&queue.size, 1);
+        atomic_fetch_add(&queue.visited, 1);
     }
 
     mtx_unlock(&queue.lock);
@@ -134,7 +145,9 @@ bool tryDequeue(void** item) {
 
     Node* node = queue.head;
     queue.head = node->next;
-    if (!queue.head) queue.tail = NULL;
+    if (!queue.head) {
+        queue.tail = NULL;
+    }
 
     *item = node->data;
     free(node);
