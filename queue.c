@@ -40,52 +40,37 @@ void initQueue(void) {
 
 void destroyQueue(void) {
     mtx_lock(&queue.lock);
-    Node* node = queue.head;
-    while (node != NULL) {
-        Node* temp = node;
-        node = node->next;
-        free(temp);
+    while (queue.head) {
+        Node* tmp = queue.head;
+        queue.head = queue.head->next;
+        free(tmp);
     }
-    queue.head = NULL;
-    queue.tail = NULL;
-
-    WaitNode* waitNode = queue.waitHead;
-    while (waitNode != NULL) {
-        WaitNode* temp = waitNode;
-        waitNode = waitNode->next;
-        cnd_destroy(&temp->cond);
-        free(temp);
+    while (queue.waitHead) {
+        WaitNode* tmp = queue.waitHead;
+        queue.waitHead = queue.waitHead->next;
+        cnd_destroy(&tmp->cond);
+        free(tmp);
     }
-    queue.waitHead = NULL;
-    queue.waitTail = NULL;
-
     mtx_unlock(&queue.lock);
     mtx_destroy(&queue.lock);
 }
 
 void enqueue(void* item) {
+    mtx_lock(&queue.lock);
     Node* newNode = malloc(sizeof(Node));
     newNode->data = item;
     newNode->next = NULL;
 
-    mtx_lock(&queue.lock);
-    if (queue.tail != NULL) {
-        queue.tail->next = newNode;
-    } else {
+    if (!queue.head) {
         queue.head = newNode;
+    } else {
+        queue.tail->next = newNode;
     }
     queue.tail = newNode;
     atomic_fetch_add(&queue.size, 1);
 
-    if (queue.waitHead != NULL) {
-        WaitNode* waitNode = queue.waitHead;
-        cnd_signal(&waitNode->cond);
-        queue.waitHead = waitNode->next;
-        if (queue.waitHead == NULL) {
-            queue.waitTail = NULL;
-        }
-        cnd_destroy(&waitNode->cond);
-        free(waitNode);
+    if (queue.waitHead) {
+        cnd_signal(&queue.waitHead->cond);
     }
 
     mtx_unlock(&queue.lock);
@@ -93,33 +78,43 @@ void enqueue(void* item) {
 
 void* dequeue(void) {
     mtx_lock(&queue.lock);
-    while (queue.head == NULL) {
-        WaitNode* newWaitNode = malloc(sizeof(WaitNode));
-        cnd_init(&newWaitNode->cond);
-        newWaitNode->next = NULL;
+    while (!queue.head) {
+        if (!queue.waitHead) {
+            WaitNode* newWaitNode = malloc(sizeof(WaitNode));
+            cnd_init(&newWaitNode->cond);
+            newWaitNode->next = NULL;
 
-        if (queue.waitTail != NULL) {
-            queue.waitTail->next = newWaitNode;
-        } else {
             queue.waitHead = newWaitNode;
+            queue.waitTail = newWaitNode;
+        } else {
+            WaitNode* newWaitNode = malloc(sizeof(WaitNode));
+            cnd_init(&newWaitNode->cond);
+            newWaitNode->next = NULL;
+
+            queue.waitTail->next = newWaitNode;
+            queue.waitTail = newWaitNode;
         }
-        queue.waitTail = newWaitNode;
-
         atomic_fetch_add(&queue.waiting, 1);
-        cnd_wait(&newWaitNode->cond, &queue.lock);
+        cnd_wait(&queue.waitHead->cond, &queue.lock);
         atomic_fetch_sub(&queue.waiting, 1);
+
+        // Move the waitHead to the next node after the thread wakes up.
+        WaitNode* temp = queue.waitHead;
+        queue.waitHead = queue.waitHead->next;
+        cnd_destroy(&temp->cond);
+        free(temp);
+        if (!queue.waitHead) queue.waitTail = NULL;
     }
 
-    Node* temp = queue.head;
-    void* item = temp->data;
-    queue.head = temp->next;
-    if (queue.head == NULL) {
-        queue.tail = NULL;
-    }
+    Node* node = queue.head;
+    queue.head = queue.head->next;
+    if (!queue.head) queue.tail = NULL;
 
-    free(temp);
+    void* item = node->data;
+    free(node);
     atomic_fetch_sub(&queue.size, 1);
     atomic_fetch_add(&queue.visited, 1);
+
     mtx_unlock(&queue.lock);
     return item;
 }
@@ -129,21 +124,20 @@ bool tryDequeue(void** item) {
         return false;
     }
 
-    if (queue.head == NULL) {
+    if (!queue.head) {
         mtx_unlock(&queue.lock);
         return false;
     }
 
-    Node* temp = queue.head;
-    *item = temp->data;
-    queue.head = temp->next;
-    if (queue.head == NULL) {
-        queue.tail = NULL;
-    }
+    Node* node = queue.head;
+    queue.head = queue.head->next;
+    if (!queue.head) queue.tail = NULL;
 
-    free(temp);
+    *item = node->data;
+    free(node);
     atomic_fetch_sub(&queue.size, 1);
     atomic_fetch_add(&queue.visited, 1);
+
     mtx_unlock(&queue.lock);
     return true;
 }
