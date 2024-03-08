@@ -2,7 +2,6 @@
 #include <stdbool.h>
 #include <threads.h>
 #include <stdatomic.h>
-#include "queue.h"
 
 typedef struct Node {
     void* data;
@@ -10,9 +9,9 @@ typedef struct Node {
 } Node;
 
 typedef struct WaitNode {
+    thrd_t thread_id;
     cnd_t cond;
     struct WaitNode* next;
-    bool isSignaled;
 } WaitNode;
 
 typedef struct {
@@ -41,19 +40,21 @@ void initQueue(void) {
 
 void destroyQueue(void) {
     mtx_lock(&queue.lock);
-    while (queue.head) {
-        Node* tmp = queue.head;
-        queue.head = queue.head->next;
-        free(tmp);
+    Node* node;
+    while ((node = queue.head) != NULL) {
+        queue.head = node->next;
+        free(node);
     }
+    queue.tail = NULL;
 
-    while (queue.waitHead) {
-        WaitNode* tmp = queue.waitHead;
-        queue.waitHead = queue.waitHead->next;
-        cnd_signal(&tmp->cond);  // Ensure to signal all waiting threads.
-        cnd_destroy(&tmp->cond);
-        free(tmp);
+    WaitNode* waitNode;
+    while ((waitNode = queue.waitHead) != NULL) {
+        queue.waitHead = waitNode->next;
+        cnd_destroy(&waitNode->cond);
+        free(waitNode);
     }
+    queue.waitTail = NULL;
+
     mtx_unlock(&queue.lock);
     mtx_destroy(&queue.lock);
 }
@@ -64,23 +65,16 @@ void enqueue(void* item) {
     newNode->data = item;
     newNode->next = NULL;
 
-    if (!queue.head) {
-        queue.head = newNode;
-    } else {
+    if (queue.tail) {
         queue.tail->next = newNode;
+    } else {
+        queue.head = newNode;
     }
     queue.tail = newNode;
     atomic_fetch_add(&queue.size, 1);
 
     if (queue.waitHead) {
-        WaitNode* waitNode = queue.waitHead;
-        waitNode->isSignaled = true;
-        cnd_signal(&waitNode->cond);
-        queue.waitHead = waitNode->next;  // Remove the node from the waiting queue.
-        if (queue.waitHead == NULL) {
-            queue.waitTail = NULL;
-        }
-        free(waitNode);
+        cnd_signal(&queue.waitHead->cond);
     }
 
     mtx_unlock(&queue.lock);
@@ -88,11 +82,12 @@ void enqueue(void* item) {
 
 void* dequeue(void) {
     mtx_lock(&queue.lock);
+
     while (!queue.head) {
         WaitNode* newWaitNode = malloc(sizeof(WaitNode));
         cnd_init(&newWaitNode->cond);
+        newWaitNode->thread_id = thrd_current();
         newWaitNode->next = NULL;
-        newWaitNode->isSignaled = false;
 
         if (!queue.waitTail) {
             queue.waitHead = newWaitNode;
@@ -103,27 +98,41 @@ void* dequeue(void) {
         }
 
         atomic_fetch_add(&queue.waiting, 1);
-        while (!newWaitNode->isSignaled) {
-            cnd_wait(&newWaitNode->cond, &queue.lock);
-        }
+        cnd_wait(&newWaitNode->cond, &queue.lock);
         atomic_fetch_sub(&queue.waiting, 1);
 
-        // After waking up, check if the queue has become non-empty.
+        if (newWaitNode == queue.waitHead) {
+            queue.waitHead = newWaitNode->next;
+            if (queue.waitHead == NULL) {
+                queue.waitTail = NULL;
+            }
+        } else {
+            WaitNode* prev = queue.waitHead;
+            while (prev && prev->next != newWaitNode) {
+                prev = prev->next;
+            }
+            if (prev) {
+                prev->next = newWaitNode->next;
+                if (!prev->next) {
+                    queue.waitTail = prev;
+                }
+            }
+        }
+
+        free(newWaitNode);
         if (queue.head) {
             break;
         }
     }
 
     Node* node = queue.head;
-    if (node) {  // Make sure the queue is not empty.
+    void* item = NULL;
+    if (node) {
         queue.head = node->next;
         if (!queue.head) {
             queue.tail = NULL;
         }
-    }
-
-    void* item = node ? node->data : NULL;
-    if (node) {
+        item = node->data;
         free(node);
         atomic_fetch_sub(&queue.size, 1);
         atomic_fetch_add(&queue.visited, 1);
