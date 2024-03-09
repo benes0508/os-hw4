@@ -14,8 +14,7 @@ typedef struct {
     mtx_t lock;
     cnd_t not_empty;
     atomic_size_t size;
-    atomic_size_t visited;
-    atomic_size_t waiting;  // To keep track of the waiting threads.
+    atomic_size_t waiting;
 } ConcurrentQueue;
 
 ConcurrentQueue queue;
@@ -26,8 +25,7 @@ void initQueue(void) {
     mtx_init(&queue.lock, mtx_plain);
     cnd_init(&queue.not_empty);
     atomic_store(&queue.size, 0);
-    atomic_store(&queue.visited, 0);
-    atomic_store(&queue.waiting, 0);  // Initialize waiting count.
+    atomic_store(&queue.waiting, 0);
 }
 
 void destroyQueue(void) {
@@ -62,7 +60,6 @@ void enqueue(void* item) {
     mtx_unlock(&queue.lock);
 }
 
-
 void* dequeue(void) {
     mtx_lock(&queue.lock);
     while (!queue.head) {
@@ -77,17 +74,10 @@ void* dequeue(void) {
         queue.tail = NULL;
     }
     atomic_fetch_sub(&queue.size, 1);
-    if (atomic_load(&queue.waiting) > 0) {
-        cnd_signal(&queue.not_empty);
-    }
     mtx_unlock(&queue.lock);
     free(node); // Free the node after unlocking the mutex
     return item;
 }
-
-
-
-
 
 bool tryDequeue(void** item) {
     if (mtx_trylock(&queue.lock) != thrd_success) {
@@ -105,7 +95,6 @@ bool tryDequeue(void** item) {
     *item = node->data;
     free(node);
     atomic_fetch_sub(&queue.size, 1);
-    atomic_fetch_add(&queue.visited, 1);
     mtx_unlock(&queue.lock);
     return true;
 }
