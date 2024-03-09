@@ -119,3 +119,8 @@ size_t size(void) {
 size_t visited(void) {
     return atomic_load(&queue.visited);
 }
+
+size_t waiting(void) {
+    // How many threads are waiting for something to be in the queue?
+    return atomic_load(&queue.waitingThreads);
+}
