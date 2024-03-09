@@ -89,17 +89,18 @@ void* dequeue(void) {
     mtx_unlock(&queue.lock);
     return item;
 }
-
 bool tryDequeue(void** item) {
     if (mtx_trylock(&queue.lock) != thrd_success) {
         return false;
     }
 
+    // Ensure there is an item and that the calling thread has the correct ticket number.
     if (!queue.head || atomic_load(&queue.ticket_serve) != atomic_load(&queue.ticket_issue)) {
         mtx_unlock(&queue.lock);
         return false;
     }
 
+    // Proceed to dequeue the item.
     Node* node = queue.head;
     *item = node->data;
     queue.head = node->next;
@@ -110,12 +111,13 @@ bool tryDequeue(void** item) {
 
     free(node);
     atomic_fetch_add(&queue.visited, 1);
-    atomic_fetch_add(&queue.ticket_serve, 1);  // Next ticket
-    cnd_broadcast(&queue.has_items);
+    atomic_fetch_add(&queue.ticket_serve, 1); // Increment the ticket serve counter.
+    // No need to broadcast since it's a non-blocking try.
 
     mtx_unlock(&queue.lock);
     return true;
 }
+
 
 size_t size(void) {
     size_t count = 0;
