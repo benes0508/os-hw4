@@ -66,21 +66,21 @@ void enqueue(void* item) {
     mtx_lock(&queue.lock);
 
     if (queue.waitHead) {
-        // Wake up the first waiting thread.
-        cnd_signal(&queue.waitHead->cond);
-        // Insert the item normally, it will be picked up by the dequeuing thread.
         Node* newNode = malloc(sizeof(Node));
         newNode->data = item;
         newNode->next = NULL;
 
+        // Add item directly to the queue even if there are waiting threads.
         if (queue.items.tail) {
             queue.items.tail->next = newNode;
         } else {
             queue.items.head = newNode;
         }
         queue.items.tail = newNode;
+
+        // Signal the first waiting thread.
+        cnd_signal(&queue.waitHead->cond);
     } else {
-        // No waiting threads, just insert the item normally.
         Node* newNode = malloc(sizeof(Node));
         newNode->data = item;
         newNode->next = NULL;
@@ -100,45 +100,33 @@ void* dequeue(void) {
     mtx_lock(&queue.lock);
 
     while (!queue.items.head) {
-        if (!queue.waitHead) {
-            // If the queue is empty and no other thread is waiting, the current thread should wait.
+        if (!queue.waitTail) {
             WaitNode* waitNode = malloc(sizeof(WaitNode));
             cnd_init(&waitNode->cond);
             waitNode->thread_id = thrd_current();
             waitNode->next = NULL;
 
-            if (!queue.waitTail) {
-                queue.waitHead = waitNode;
-                queue.waitTail = waitNode;
-            } else {
-                queue.waitTail->next = waitNode;
-                queue.waitTail = waitNode;
-            }
+            queue.waitHead = waitNode;
+            queue.waitTail = waitNode;
 
             atomic_fetch_add(&queue.waiting, 1);
             cnd_wait(&waitNode->cond, &queue.lock);
             atomic_fetch_sub(&queue.waiting, 1);
 
+            // Remove the wait node after it's been signaled.
             if (queue.waitHead == queue.waitTail) {
                 queue.waitHead = queue.waitTail = NULL;
             } else {
                 queue.waitHead = queue.waitHead->next;
             }
-            
-            free(waitNode);
 
-            // After waiting, attempt to take the next available item.
-            if (queue.items.head) {
-                break;
-            }
-        } else {
-            // Should never reach here since other threads are waiting to be served first.
-            mtx_unlock(&queue.lock);
-            return NULL;
+            free(waitNode);
         }
+
+        // Breaking out to handle dequeuing outside the loop.
+        break;
     }
 
-    // Take the next available item.
     Node* node = queue.items.head;
     void* item = NULL;
     if (node) {
@@ -164,7 +152,7 @@ bool tryDequeue(void** item) {
 
     Node* node = queue.items.head;
     queue.items.head = node->next;
-    
+
     if (!queue.items.head) {
         queue.items.tail = NULL;
     }
