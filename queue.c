@@ -74,6 +74,7 @@ void enqueue(void* item) {
     atomic_fetch_add(&queue.size, 1);
 
     if (queue.waitHead) {
+        // Signal the first waiting thread only.
         cnd_signal(&queue.waitHead->cond);
     }
 
@@ -84,44 +85,35 @@ void* dequeue(void) {
     mtx_lock(&queue.lock);
 
     while (!queue.head) {
-        WaitNode* newWaitNode = malloc(sizeof(WaitNode));
-        cnd_init(&newWaitNode->cond);
-        newWaitNode->thread_id = thrd_current();
-        newWaitNode->next = NULL;
-
         if (!queue.waitTail) {
+            WaitNode* newWaitNode = malloc(sizeof(WaitNode));
+            cnd_init(&newWaitNode->cond);
+            newWaitNode->thread_id = thrd_current();
+            newWaitNode->next = NULL;
             queue.waitHead = newWaitNode;
             queue.waitTail = newWaitNode;
         } else {
+            WaitNode* newWaitNode = malloc(sizeof(WaitNode));
+            cnd_init(&newWaitNode->cond);
+            newWaitNode->thread_id = thrd_current();
+            newWaitNode->next = NULL;
             queue.waitTail->next = newWaitNode;
             queue.waitTail = newWaitNode;
         }
 
         atomic_fetch_add(&queue.waiting, 1);
-        cnd_wait(&newWaitNode->cond, &queue.lock);
+        cnd_wait(&queue.waitHead->cond, &queue.lock);
         atomic_fetch_sub(&queue.waiting, 1);
 
-        if (newWaitNode == queue.waitHead) {
-            queue.waitHead = newWaitNode->next;
-            if (queue.waitHead == NULL) {
+        // Move to the next waiting node after current node is done waiting.
+        if (queue.waitHead) {
+            WaitNode* temp = queue.waitHead;
+            queue.waitHead = queue.waitHead->next;
+            if (!queue.waitHead) {
                 queue.waitTail = NULL;
             }
-        } else {
-            WaitNode* prev = queue.waitHead;
-            while (prev && prev->next != newWaitNode) {
-                prev = prev->next;
-            }
-            if (prev) {
-                prev->next = newWaitNode->next;
-                if (!prev->next) {
-                    queue.waitTail = prev;
-                }
-            }
-        }
-
-        free(newWaitNode);
-        if (queue.head) {
-            break;
+            cnd_destroy(&temp->cond);
+            free(temp);
         }
     }
 
@@ -141,6 +133,8 @@ void* dequeue(void) {
     mtx_unlock(&queue.lock);
     return item;
 }
+
+// The rest of your functions (tryDequeue, size, waiting, visited) remain the same.
 
 bool tryDequeue(void** item) {
     if (mtx_trylock(&queue.lock) != thrd_success) {
