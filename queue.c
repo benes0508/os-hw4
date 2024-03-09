@@ -36,7 +36,7 @@ typedef struct {
 
 DataStreamProcessor dataStream;
 
-void initializeDataStream(void) {
+void initQueue(void) {
     // Prepares the data stream for operation.
     dataStream.inlet = NULL;
     dataStream.outlet = NULL;
@@ -52,7 +52,7 @@ void initializeDataStream(void) {
     atomic_store(&dataStream.nextTicket, 0);
 }
 
-void terminateDataStream(void) {
+void destroyQueue(void) {
     // Deactivates the data stream and cleans up.
     DataPacket* currentPacket = dataStream.inlet;
     while (currentPacket) {
@@ -74,7 +74,7 @@ void terminateDataStream(void) {
     mtx_destroy(&dataStream.syncLock);
 }
 
-void feedData(void* payload) {
+void enqueue(void* payload) {
     // Introduces a new data packet into the stream.
     DataPacket* newPacket = malloc(sizeof(DataPacket));
     if (!newPacket) {
@@ -99,7 +99,7 @@ void feedData(void* payload) {
     mtx_unlock(&dataStream.streamLock);
 }
 
-void* processData(void) {
+void* dequeue(void) {
     // Extracts and processes a data packet from the stream.
     mtx_lock(&dataStream.streamLock);
 
@@ -127,7 +127,7 @@ void* processData(void) {
     return payload;
 }
 
-bool attemptProcessData(void** payload) {
+bool tryDequeue(void** payload) {
     // Tries to process data without waiting for signal.
     if (mtx_trylock(&dataStream.streamLock) == thrd_success) {
         if (!dataStream.inlet) {
@@ -153,17 +153,17 @@ bool attemptProcessData(void** payload) {
     return false;
 }
 
-size_t currentVolume(void) {
+size_t size(void) {
     // Reports the current volume of data in the stream.
     return atomic_load(&dataStream.streamVolume);
 }
 
-size_t processorsWaiting(void) {
+size_t waiting(void) {
     // Lists the number of processors in idle state.
     return atomic_load(&dataStream.idleProcessors);
 }
 
-size_t packetsProcessed(void) {
+size_t visited(void) {
     // Counts the packets processed over time.
     return atomic_load(&dataStream.processedPackets);
 }
