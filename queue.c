@@ -27,7 +27,7 @@ void initQueue(void) {
     queue.items.head = NULL;
     queue.items.tail = NULL;
     mtx_init(&queue.lock, mtx_plain);
-    cnd_init(&queue.has_items, NULL);
+    cnd_init(&queue.has_items);
     atomic_store(&queue.waiting, 0);
     atomic_store(&queue.visited, 0);
 }
@@ -119,7 +119,7 @@ size_t size(void) {
     mtx_lock(&queue.lock);
     Node* current = queue.items.head;
     while (current) {
-        count++;
+        ++count;
         current = current->next;
     }
     mtx_unlock(&queue.lock);
