@@ -97,32 +97,39 @@ void* dequeue(void) {
     return item;
 }
 
+
 bool tryDequeue(void** item) {
     if (mtx_trylock(&queue.lock) == thrd_success) {
-        if (!queue.head || atomic_load(&queue.current_ticket) != atomic_load(&queue.next_ticket)) {
+        // Check if the queue is not empty and if the calling thread has the correct ticket
+        if (queue.head && atomic_load(&queue.current_ticket) == atomic_load(&queue.next_ticket)) {
+            Node* node = queue.head;
+            *item = node->data;
+            queue.head = node->next;
+
+            if (!queue.head) {
+                queue.tail = NULL;
+            }
+
+            free(node);
+            atomic_fetch_sub(&queue.size, 1);
+            atomic_fetch_add(&queue.visited, 1);
+            atomic_fetch_add(&queue.current_ticket, 1);
+
+            // Since we've successfully dequeued, we need to update the next ticket
+            // However, this isn't typically how tryDequeue would handle tickets because it doesn't 'wait'.
+            // If another thread holds the next ticket, this won't enforce proper turn order without waiting.
+            
+            mtx_unlock(&queue.lock);
+            return true;
+        } else {
             mtx_unlock(&queue.lock);
             return false;
         }
-
-        Node* node = queue.head;
-        *item = node->data;
-        queue.head = node->next;
-
-        if (!queue.head) {
-            queue.tail = NULL;
-        }
-
-        free(node);
-        atomic_fetch_sub(&queue.size, 1);
-        atomic_fetch_add(&queue.visited, 1);
-        atomic_fetch_add(&queue.current_ticket, 1); // This is important even for tryDequeue.
-
-        mtx_unlock(&queue.lock);
-        return true;
     }
 
     return false;
 }
+
 
 size_t size(void) {
     return atomic_load(&queue.size);
