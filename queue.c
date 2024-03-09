@@ -50,7 +50,7 @@ void destroyQueue(void) {
 void enqueue(void* item) {
     mtx_lock(&queue.lock);
 
-    Node* newNode = (Node*)malloc(sizeof(Node));
+    Node* newNode = malloc(sizeof(Node));
     newNode->data = item;
     newNode->next = NULL;
 
@@ -61,7 +61,10 @@ void enqueue(void* item) {
     }
     queue.items.tail = newNode;
 
-    cnd_signal(&queue.has_items);
+    if (atomic_load(&queue.waiting) > 0) {
+        cnd_signal(&queue.has_items);
+    }
+
     mtx_unlock(&queue.lock);
 }
 
