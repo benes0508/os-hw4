@@ -384,32 +384,7 @@ int producer_thread(void *arg) {
 }
 
 
-int consumer_thread(void *arg)
-{
-    int *dequeue_order = (int *)arg;
 
-    void *item = dequeue();
-
-    *dequeue_order = *(int *)item;
-    free(item);
-
-    return 0;
-}
-
-int producer_thread(void *arg)
-{
-    (void)arg;
-
-    // Enqueue at least NUM_THREADS items
-    for (int i = 0; i < NUM_THREADS; i++)
-    {
-        int *item = malloc(sizeof(int));
-        *item = i + 1;
-        enqueue(item);
-    }
-
-    return 0;
-}
 void test_multiconcurrent_enqueue_dequeue()
 {
     printf("=== Testing multiconcurrent enqueue and dequeue ===\n");
