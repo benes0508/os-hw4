@@ -62,8 +62,6 @@ void enqueue(void* item) {
     mtx_unlock(&queue.lock);
 }
 
-
-
 void* dequeue(void) {
     mtx_lock(&queue.lock);
     while (!queue.head) {
