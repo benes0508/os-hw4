@@ -15,6 +15,7 @@ typedef struct {
     Node* tail;
     atomic_size_t size;
     atomic_size_t visited;
+    atomic_size_t waiting; // Track the number of waiting threads.
 } ConcurrentQueue;
 
 ConcurrentQueue queue;
@@ -26,11 +27,10 @@ void initQueue(void) {
     cnd_init(&queue.has_items);
     atomic_store(&queue.size, 0);
     atomic_store(&queue.visited, 0);
+    atomic_store(&queue.waiting, 0); // Initialize waiting threads count.
 }
 
 void destroyQueue(void) {
-    mtx_lock(&queue.lock);
-
     Node* node = queue.head;
     while (node) {
         Node* tmp = node;
@@ -38,27 +38,30 @@ void destroyQueue(void) {
         free(tmp);
     }
 
-    mtx_unlock(&queue.lock);
     mtx_destroy(&queue.lock);
     cnd_destroy(&queue.has_items);
 }
 
 void enqueue(void* item) {
-    mtx_lock(&queue.lock);
-
     Node* newNode = malloc(sizeof(Node));
     newNode->data = item;
     newNode->next = NULL;
 
+    mtx_lock(&queue.lock);
+
     if (!queue.tail) {
-        queue.head = queue.tail = newNode;
+        queue.head = newNode;
     } else {
         queue.tail->next = newNode;
-        queue.tail = newNode;
     }
+    queue.tail = newNode;
 
     atomic_fetch_add(&queue.size, 1);
-    cnd_signal(&queue.has_items);
+    
+    // If there are any waiting threads, wake one up.
+    if (atomic_load(&queue.waiting) > 0) {
+        cnd_signal(&queue.has_items);
+    }
 
     mtx_unlock(&queue.lock);
 }
@@ -67,7 +70,9 @@ void* dequeue(void) {
     mtx_lock(&queue.lock);
 
     while (queue.head == NULL) {
+        atomic_fetch_add(&queue.waiting, 1);
         cnd_wait(&queue.has_items, &queue.lock);
+        atomic_fetch_sub(&queue.waiting, 1);
     }
 
     Node* node = queue.head;
@@ -121,6 +126,6 @@ size_t visited(void) {
 }
 
 size_t waiting(void) {
-    // How many threads are waiting for something to be in the queue?
-    return atomic_load(&queue.waitingThreads);
+    // Return the number of waiting threads.
+    return atomic_load(&queue.waiting);
 }
