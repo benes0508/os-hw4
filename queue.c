@@ -11,7 +11,6 @@ typedef struct Node {
 typedef struct {
     Node* head;
     Node* tail;
-    atomic_size_t size;
 } ItemQueue;
 
 typedef struct WaitNode {
@@ -62,18 +61,24 @@ void destroyQueue(void) {
     mtx_unlock(&queue.lock);
     mtx_destroy(&queue.lock);
 }
+
 void enqueue(void* item) {
     mtx_lock(&queue.lock);
 
     if (queue.waitHead) {
-        // If there are waiting threads, wake the first one and pass the item directly.
+        // Wake up the first waiting thread.
+        cnd_signal(&queue.waitHead->cond);
+        // Insert the item normally, it will be picked up by the dequeuing thread.
         Node* newNode = malloc(sizeof(Node));
         newNode->data = item;
         newNode->next = NULL;
 
-        // Attach item directly to the waiting node for direct retrieval.
-        queue.waitHead->data = newNode;
-        cnd_signal(&queue.waitHead->cond);
+        if (queue.items.tail) {
+            queue.items.tail->next = newNode;
+        } else {
+            queue.items.head = newNode;
+        }
+        queue.items.tail = newNode;
     } else {
         // No waiting threads, just insert the item normally.
         Node* newNode = malloc(sizeof(Node));
@@ -94,39 +99,48 @@ void enqueue(void* item) {
 void* dequeue(void) {
     mtx_lock(&queue.lock);
 
-    while (!queue.items.head && !queue.waitHead) {
-        // If there's no item and no direct hand-off, wait.
-        WaitNode* waitNode = malloc(sizeof(WaitNode));
-        cnd_init(&waitNode->cond);
-        waitNode->thread_id = thrd_current();
-        waitNode->next = NULL;
-        waitNode->data = NULL;
+    while (!queue.items.head) {
+        if (!queue.waitHead) {
+            // If the queue is empty and no other thread is waiting, the current thread should wait.
+            WaitNode* waitNode = malloc(sizeof(WaitNode));
+            cnd_init(&waitNode->cond);
+            waitNode->thread_id = thrd_current();
+            waitNode->next = NULL;
 
-        if (!queue.waitTail) {
-            queue.waitHead = waitNode;
-            queue.waitTail = waitNode;
-        } else {
-            queue.waitTail->next = waitNode;
-            queue.waitTail = waitNode;
-        }
+            if (!queue.waitTail) {
+                queue.waitHead = waitNode;
+                queue.waitTail = waitNode;
+            } else {
+                queue.waitTail->next = waitNode;
+                queue.waitTail = waitNode;
+            }
 
-        cnd_wait(&waitNode->cond, &queue.lock);
+            atomic_fetch_add(&queue.waiting, 1);
+            cnd_wait(&waitNode->cond, &queue.lock);
+            atomic_fetch_sub(&queue.waiting, 1);
 
-        // After waking up, check if there's direct data hand-off.
-        if (waitNode->data) {
-            Node* node = waitNode->data;
-            void* item = node->data;
-            free(node);
+            if (queue.waitHead == queue.waitTail) {
+                queue.waitHead = queue.waitTail = NULL;
+            } else {
+                queue.waitHead = queue.waitHead->next;
+            }
+            
             free(waitNode);
+
+            // After waiting, attempt to take the next available item.
+            if (queue.items.head) {
+                break;
+            }
+        } else {
+            // Should never reach here since other threads are waiting to be served first.
             mtx_unlock(&queue.lock);
-            return item;
+            return NULL;
         }
     }
 
-    // Regular dequeue process if there's no waiting node or direct hand-off.
+    // Take the next available item.
     Node* node = queue.items.head;
     void* item = NULL;
-
     if (node) {
         queue.items.head = node->next;
         if (!queue.items.head) {
@@ -140,29 +154,24 @@ void* dequeue(void) {
     return item;
 }
 
-// The rest of your functions (tryDequeue, size, waiting, visited) remain the same.
 bool tryDequeue(void** item) {
     mtx_lock(&queue.lock);
 
-    // Adjusted to reference the queue.items.head instead of queue.head
     if (!queue.items.head) {
         mtx_unlock(&queue.lock);
         return false;
     }
 
-    // Adjusted to reference the queue.items.head instead of queue.head
     Node* node = queue.items.head;
     queue.items.head = node->next;
     
-    // Adjusted to reference the queue.items.head and queue.items.tail
     if (!queue.items.head) {
         queue.items.tail = NULL;
     }
 
     *item = node->data;
     free(node);
-    
-    // This line does not need to adjust because visited is not encapsulated.
+
     atomic_fetch_add(&queue.visited, 1);
 
     mtx_unlock(&queue.lock);
@@ -170,18 +179,16 @@ bool tryDequeue(void** item) {
 }
 
 size_t size(void) {
-    // Adjusted to reference the correct item count
     size_t count = 0;
     mtx_lock(&queue.lock);
     Node* current = queue.items.head;
     while (current) {
-        count++;
+        ++count;
         current = current->next;
     }
     mtx_unlock(&queue.lock);
     return count;
 }
-
 
 size_t waiting(void) {
     return atomic_load(&queue.waiting);
