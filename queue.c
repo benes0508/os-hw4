@@ -6,141 +6,163 @@
 #include <unistd.h>
 #include <assert.h>
 
-// Renamed structure for each item in the queue.
-typedef struct DataNode {
-    void* item; // The data stored in this node.
-    struct DataNode* nextNode; // Pointer to the next node in the queue.
-} DataNode;
+// A structure representing each passenger in the line.
+typedef struct PassengerNode {
+    void* luggage; // Luggage carried by the passenger.
+    struct PassengerNode* nextInLine; // Pointer to the next passenger in line.
+} PassengerNode;
 
-// Renamed structure for managing threads that are waiting.
-typedef struct WaitNode {
-    cnd_t waitCond; // Condition variable for waiting.
-    struct WaitNode* nextWait; // Next waiting thread node.
-} WaitNode;
+// A structure for managing passengers waiting for their boarding call.
+typedef struct BoardingCallNode {
+    cnd_t boardingCall; // Condition variable for boarding call.
+    struct BoardingCallNode* nextWaitingPassenger; // Pointer to the next passenger waiting for boarding call.
+} BoardingCallNode;
 
-// Renamed main structure for the queue.
+// The primary structure for the passenger queue at the boarding gate.
 typedef struct {
-    DataNode* first; // Start of the queue.
-    DataNode* last; // End of the queue.
-    mtx_t lockQueue; // Mutex for synchronizing access to the queue.
-    cnd_t notEmptyCond; // Condition variable to wait on when queue is empty.
-    atomic_size_t queueSize; // Number of items in the queue.
-    atomic_size_t threadsWaiting; // Count of threads waiting for an item.
-    atomic_size_t itemsProcessed; // Count of items that have been processed.
-    WaitNode* firstWait; // Start of the list of waiting threads.
-    WaitNode* lastWait; // End of the list of waiting threads.
-} SyncQueue;
+    PassengerNode* boardingGateStart; // Pointer to the first passenger in line.
+    PassengerNode* boardingGateEnd; // Pointer to the last passenger in line.
+    mtx_t boardingGateMutex; // Mutex for synchronizing access to the passenger line.
+    cnd_t boardingQueueNotEmpty; // Condition variable to signal when the line is not empty.
+    atomic_size_t queueLength; // The total number of passengers in line.
+    atomic_size_t waitingPassengers; // Number of passengers waiting for boarding to start.
+    atomic_size_t processedPassengers; // Count of passengers that have been processed for boarding.
+    BoardingCallNode* firstWaitingPassenger; // Pointer to the first passenger in the waiting area.
+    BoardingCallNode* lastWaitingPassenger; // Pointer to the last passenger in the waiting area.
+    mtx_t waitingAreaMutex; // Mutex for synchronizing access to the waiting area.
+    atomic_uint currentBoardingPass; // The current boarding pass being processed.
+    atomic_uint nextBoardingPass; // The next boarding pass to be issued.
+} BoardingQueue;
 
-SyncQueue syncQueue;
 
-void initQueue(void) {
-    syncQueue.first = NULL;
-    syncQueue.last = NULL;
-    mtx_init(&syncQueue.lockQueue, mtx_plain);
-    cnd_init(&syncQueue.notEmptyCond);
-    atomic_store(&syncQueue.queueSize, 0);
-    atomic_store(&syncQueue.threadsWaiting, 0);
-    atomic_store(&syncQueue.itemsProcessed, 0);
-    syncQueue.firstWait = NULL;
-    syncQueue.lastWait = NULL;
+BoardingQueue boardingQueue;
+
+void initializeBoardingQueue(void) {
+    // Prepare the boarding queue before flights start boarding.
+    boardingQueue.boardingGateStart = NULL;
+    boardingQueue.boardingGateEnd = NULL;
+    mtx_init(&boardingQueue.boardingGateMutex, mtx_plain);
+    cnd_init(&boardingQueue.boardingQueueNotEmpty);
+    atomic_store(&boardingQueue.queueLength, 0);
+    atomic_store(&boardingQueue.waitingPassengers, 0);
+    atomic_store(&boardingQueue.processedPassengers, 0);
+    boardingQueue.firstWaitingPassenger = NULL;
+    boardingQueue.lastWaitingPassenger = NULL;
+    mtx_init(&boardingQueue.waitingAreaMutex, mtx_plain);
+    atomic_store(&boardingQueue.currentBoardingPass, 0);
+    atomic_store(&boardingQueue.nextBoardingPass, 0);
 }
 
-void destroyQueue(void) {
-    DataNode* current = syncQueue.first;
-    while (current) {
-        DataNode* temp = current;
-        current = current->nextNode;
-        free(temp); // Free each node.
+void clearBoardingQueue(void) {
+    // Tidy up after the last flight has boarded.
+    PassengerNode* currentPassenger = boardingQueue.boardingGateStart;
+    while (currentPassenger) {
+        PassengerNode* temp = currentPassenger;
+        currentPassenger = currentPassenger->nextInLine;
+        free(temp); // Free memory allocated for each passenger node.
     }
     
-    WaitNode* currentWait = syncQueue.firstWait;
-    while (currentWait) {
-        WaitNode* tempWait = currentWait;
-        currentWait = currentWait->nextWait;
-        cnd_destroy(&tempWait->waitCond); // Clean up each waiting node.
-        free(tempWait);
+    BoardingCallNode* currentCallNode = boardingQueue.firstWaitingPassenger;
+    while (currentCallNode) {
+        BoardingCallNode* temp = currentCallNode;
+        currentCallNode = currentCallNode->nextWaitingPassenger;
+        cnd_destroy(&temp->boardingCall); // Clean up each waiting passenger node.
+        free(temp);
     }
 
-    mtx_destroy(&syncQueue.lockQueue);
-    cnd_destroy(&syncQueue.notEmptyCond);
+    // Dispose of synchronization primitives.
+    mtx_destroy(&boardingQueue.boardingGateMutex);
+    cnd_destroy(&boardingQueue.boardingQueueNotEmpty);
+    mtx_destroy(&boardingQueue.waitingAreaMutex);
 }
 
-void enqueue(void* item) {
-    DataNode* newNode = malloc(sizeof(DataNode));
-    newNode->item = item;
-    newNode->nextNode = NULL;
+void boardPassenger(void* luggage) {
+    // Enqueue a passenger with their luggage at the end of the boarding line.
+    PassengerNode* newPassenger = malloc(sizeof(PassengerNode));
+    if (!newPassenger) {
+        fprintf(stderr, "Error: Unable to allocate memory for new passenger.\n");
+        return;
+    }
+    newPassenger->luggage = luggage;
+    newPassenger->nextInLine = NULL;
 
-    mtx_lock(&syncQueue.lockQueue);
+    mtx_lock(&boardingQueue.boardingGateMutex);
 
-    if (syncQueue.last == NULL) {
-        syncQueue.first = syncQueue.last = newNode;
+    if (boardingQueue.boardingGateEnd == NULL) {
+        boardingQueue.boardingGateStart = boardingQueue.boardingGateEnd = newPassenger;
+        cnd_signal(&boardingQueue.boardingQueueNotEmpty);
     } else {
-        syncQueue.last->nextNode = newNode;
-        syncQueue.last = newNode;
+        boardingQueue.boardingGateEnd->nextInLine = newPassenger;
+        boardingQueue.boardingGateEnd = newPassenger;
     }
 
-    atomic_fetch_add(&syncQueue.queueSize, 1);
-    cnd_signal(&syncQueue.notEmptyCond);
+    atomic_fetch_add(&boardingQueue.queueLength, 1);
 
-    mtx_unlock(&syncQueue.lockQueue);
+    mtx_unlock(&boardingQueue.boardingGateMutex);
 }
 
-void* dequeue(void) {
-    mtx_lock(&syncQueue.lockQueue);
+void* deboardPassenger(void) {
+    // Dequeue a passenger from the start of the boarding line.
+    mtx_lock(&boardingQueue.boardingGateMutex);
 
-    while (syncQueue.first == NULL) {
-        cnd_wait(&syncQueue.notEmptyCond, &syncQueue.lockQueue);
+    while (boardingQueue.boardingGateStart == NULL) {
+        cnd_wait(&boardingQueue.boardingQueueNotEmpty, &boardingQueue.boardingGateMutex);
     }
 
-    DataNode* node = syncQueue.first;
-    syncQueue.first = node->nextNode;
-    if (syncQueue.first == NULL) {
-        syncQueue.last = NULL;
+    PassengerNode* passenger = boardingQueue.boardingGateStart;
+    boardingQueue.boardingGateStart = passenger->nextInLine;
+    if (boardingQueue.boardingGateStart == NULL) {
+        boardingQueue.boardingGateEnd = NULL;
     }
 
-    void* item = node->item;
-    free(node);
+    void* luggage = passenger->luggage;
+    free(passenger);
 
-    atomic_fetch_sub(&syncQueue.queueSize, 1);
-    atomic_fetch_add(&syncQueue.itemsProcessed, 1);
+    atomic_fetch_sub(&boardingQueue.queueLength, 1);
+    atomic_fetch_add(&boardingQueue.processedPassengers, 1);
 
-    mtx_unlock(&syncQueue.lockQueue);
-    return item;
+    if (boardingQueue.boardingGateStart != NULL) {
+        cnd_signal(&boardingQueue.boardingQueueNotEmpty);
+    }
+
+    mtx_unlock(&boardingQueue.boardingGateMutex);
+    return luggage;
 }
 
-bool tryDequeue(void** item) {
-    if (mtx_trylock(&syncQueue.lockQueue) == thrd_success) {
-        if (syncQueue.first == NULL) {
-            mtx_unlock(&syncQueue.lockQueue);
+bool tryBoardPassenger(void** luggage) {
+    // Attempt to board a passenger without delay.
+    if (mtx_trylock(&boardingQueue.boardingGateMutex) == thrd_success) {
+        if (boardingQueue.boardingGateStart == NULL) {
+            mtx_unlock(&boardingQueue.boardingGateMutex);
             return false;
         }
 
-        DataNode* node = syncQueue.first;
-        *item = node->item;
-        syncQueue.first = node->nextNode;
-        if (syncQueue.first == NULL) {
-            syncQueue.last = NULL;
+        PassengerNode* tempPassenger = boardingQueue.boardingGateStart;
+        *luggage = tempPassenger->luggage;
+        boardingQueue.boardingGateStart = boardingQueue.boardingGateStart->nextInLine;
+        
+        if (boardingQueue.boardingGateStart == NULL) {
+            boardingQueue.boardingGateEnd = NULL;
         }
 
-        atomic_fetch_sub(&syncQueue.queueSize, 1);
-        atomic_fetch_add(&syncQueue.itemsProcessed, 1);
+        atomic_fetch_sub(&boardingQueue.queueLength, 1);
+        atomic_fetch_add(&boardingQueue.processedPassengers, 1);
 
-        free(node);
-        mtx_unlock(&syncQueue.lockQueue);
-        return true;
+        free(tempPassenger);
+        mtx_unlock(&boardingQueue.boardingGateMutex);
+
+        return true; // Successfully boarded a passenger.
     }
 
-    return false;
+    return false; // Boarding gate was busy, try again later.
 }
 
-size_t size(void) {
-    return atomic_load(&syncQueue.queueSize);
+size_t passengersWaiting(void) {
+    // Check how many passengers are currently waiting in line.
+    return atomic_load(&boardingQueue.queueLength);
 }
 
-size_t waiting(void) {
-    return atomic_load(&syncQueue.threadsWaiting);
-}
-
-size_t visited(void) {
-    return atomic_load(&syncQueue.itemsProcessed);
+size_t passengersProcessed(void) {
+    // Count how many passengers have successfully boarded.
+    return atomic_load(&boardingQueue.processedPassengers);
 }
