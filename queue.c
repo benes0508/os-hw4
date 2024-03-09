@@ -6,163 +6,164 @@
 #include <unistd.h>
 #include <assert.h>
 
-// A structure representing each passenger in the line.
-typedef struct PassengerNode {
-    void* luggage; // Luggage carried by the passenger.
-    struct PassengerNode* nextInLine; // Pointer to the next passenger in line.
-} PassengerNode;
+// Data Packet Node in the Stream.
+typedef struct DataPacket {
+    void* payload; // Contents of this packet.
+    struct DataPacket* flowNext; // Link to the next packet in the stream.
+} DataPacket;
 
-// A structure for managing passengers waiting for their boarding call.
-typedef struct BoardingCallNode {
-    cnd_t boardingCall; // Condition variable for boarding call.
-    struct BoardingCallNode* nextWaitingPassenger; // Pointer to the next passenger waiting for boarding call.
-} BoardingCallNode;
+// For synchronizing data flow processors awaiting tasks.
+typedef struct ProcessorSyncNode {
+    cnd_t awaitSignal; // Signal for processors to synchronize.
+    struct ProcessorSyncNode* link; // Chain to the next node.
+} ProcessorSyncNode;
 
-// The primary structure for the passenger queue at the boarding gate.
+// Core structure of the Data Stream Processor.
 typedef struct {
-    PassengerNode* boardingGateStart; // Pointer to the first passenger in line.
-    PassengerNode* boardingGateEnd; // Pointer to the last passenger in line.
-    mtx_t boardingGateMutex; // Mutex for synchronizing access to the passenger line.
-    cnd_t boardingQueueNotEmpty; // Condition variable to signal when the line is not empty.
-    atomic_size_t queueLength; // The total number of passengers in line.
-    atomic_size_t waitingPassengers; // Number of passengers waiting for boarding to start.
-    atomic_size_t processedPassengers; // Count of passengers that have been processed for boarding.
-    BoardingCallNode* firstWaitingPassenger; // Pointer to the first passenger in the waiting area.
-    BoardingCallNode* lastWaitingPassenger; // Pointer to the last passenger in the waiting area.
-    mtx_t waitingAreaMutex; // Mutex for synchronizing access to the waiting area.
-    atomic_uint currentBoardingPass; // The current boarding pass being processed.
-    atomic_uint nextBoardingPass; // The next boarding pass to be issued.
-} BoardingQueue;
+    DataPacket* inlet; // Entry point of the data stream.
+    DataPacket* outlet; // Exit point of the data stream.
+    mtx_t streamLock; // Ensures exclusive access to the data stream.
+    cnd_t dataAvailable; // Signal that data is present in the stream.
+    atomic_size_t streamVolume; // Quantity of data packets in the stream.
+    atomic_size_t idleProcessors; // Count of processors waiting for data.
+    atomic_size_t processedPackets; // Tally of processed data packets.
+    ProcessorSyncNode* firstIdle; // Head of the waiting processors list.
+    ProcessorSyncNode* lastIdle; // Tail of the waiting processors list.
+    mtx_t syncLock; // Lock for coordinating the idle processors.
+    atomic_uint activeTicket; // Currently active processing ticket.
+    atomic_uint nextTicket; // Ticket for the next processing sequence.
+} DataStreamProcessor;
 
+DataStreamProcessor dataStream;
 
-BoardingQueue boardingQueue;
-
-void initializeBoardingQueue(void) {
-    // Prepare the boarding queue before flights start boarding.
-    boardingQueue.boardingGateStart = NULL;
-    boardingQueue.boardingGateEnd = NULL;
-    mtx_init(&boardingQueue.boardingGateMutex, mtx_plain);
-    cnd_init(&boardingQueue.boardingQueueNotEmpty);
-    atomic_store(&boardingQueue.queueLength, 0);
-    atomic_store(&boardingQueue.waitingPassengers, 0);
-    atomic_store(&boardingQueue.processedPassengers, 0);
-    boardingQueue.firstWaitingPassenger = NULL;
-    boardingQueue.lastWaitingPassenger = NULL;
-    mtx_init(&boardingQueue.waitingAreaMutex, mtx_plain);
-    atomic_store(&boardingQueue.currentBoardingPass, 0);
-    atomic_store(&boardingQueue.nextBoardingPass, 0);
+void initializeDataStream(void) {
+    // Prepares the data stream for operation.
+    dataStream.inlet = NULL;
+    dataStream.outlet = NULL;
+    mtx_init(&dataStream.streamLock, mtx_plain);
+    cnd_init(&dataStream.dataAvailable);
+    atomic_store(&dataStream.streamVolume, 0);
+    atomic_store(&dataStream.idleProcessors, 0);
+    atomic_store(&dataStream.processedPackets, 0);
+    dataStream.firstIdle = NULL;
+    dataStream.lastIdle = NULL;
+    mtx_init(&dataStream.syncLock, mtx_plain);
+    atomic_store(&dataStream.activeTicket, 0);
+    atomic_store(&dataStream.nextTicket, 0);
 }
 
-void clearBoardingQueue(void) {
-    // Tidy up after the last flight has boarded.
-    PassengerNode* currentPassenger = boardingQueue.boardingGateStart;
-    while (currentPassenger) {
-        PassengerNode* temp = currentPassenger;
-        currentPassenger = currentPassenger->nextInLine;
-        free(temp); // Free memory allocated for each passenger node.
-    }
-    
-    BoardingCallNode* currentCallNode = boardingQueue.firstWaitingPassenger;
-    while (currentCallNode) {
-        BoardingCallNode* temp = currentCallNode;
-        currentCallNode = currentCallNode->nextWaitingPassenger;
-        cnd_destroy(&temp->boardingCall); // Clean up each waiting passenger node.
-        free(temp);
+void terminateDataStream(void) {
+    // Deactivates the data stream and cleans up.
+    DataPacket* currentPacket = dataStream.inlet;
+    while (currentPacket) {
+        DataPacket* toRelease = currentPacket;
+        currentPacket = currentPacket->flowNext;
+        free(toRelease);
     }
 
-    // Dispose of synchronization primitives.
-    mtx_destroy(&boardingQueue.boardingGateMutex);
-    cnd_destroy(&boardingQueue.boardingQueueNotEmpty);
-    mtx_destroy(&boardingQueue.waitingAreaMutex);
+    ProcessorSyncNode* currentSyncNode = dataStream.firstIdle;
+    while (currentSyncNode) {
+        ProcessorSyncNode* toClean = currentSyncNode;
+        currentSyncNode = currentSyncNode->link;
+        cnd_destroy(&toClean->awaitSignal);
+        free(toClean);
+    }
+
+    mtx_destroy(&dataStream.streamLock);
+    cnd_destroy(&dataStream.dataAvailable);
+    mtx_destroy(&dataStream.syncLock);
 }
 
-void boardPassenger(void* luggage) {
-    // Enqueue a passenger with their luggage at the end of the boarding line.
-    PassengerNode* newPassenger = malloc(sizeof(PassengerNode));
-    if (!newPassenger) {
-        fprintf(stderr, "Error: Unable to allocate memory for new passenger.\n");
+void feedData(void* payload) {
+    // Introduces a new data packet into the stream.
+    DataPacket* newPacket = malloc(sizeof(DataPacket));
+    if (!newPacket) {
+        fprintf(stderr, "Allocation error: Failed to create new data packet.\n");
         return;
     }
-    newPassenger->luggage = luggage;
-    newPassenger->nextInLine = NULL;
+    newPacket->payload = payload;
+    newPacket->flowNext = NULL;
 
-    mtx_lock(&boardingQueue.boardingGateMutex);
+    mtx_lock(&dataStream.streamLock);
 
-    if (boardingQueue.boardingGateEnd == NULL) {
-        boardingQueue.boardingGateStart = boardingQueue.boardingGateEnd = newPassenger;
-        cnd_signal(&boardingQueue.boardingQueueNotEmpty);
+    if (!dataStream.outlet) {
+        dataStream.inlet = dataStream.outlet = newPacket;
+        cnd_signal(&dataStream.dataAvailable);
     } else {
-        boardingQueue.boardingGateEnd->nextInLine = newPassenger;
-        boardingQueue.boardingGateEnd = newPassenger;
+        dataStream.outlet->flowNext = newPacket;
+        dataStream.outlet = newPacket;
     }
 
-    atomic_fetch_add(&boardingQueue.queueLength, 1);
+    atomic_fetch_add(&dataStream.streamVolume, 1);
 
-    mtx_unlock(&boardingQueue.boardingGateMutex);
+    mtx_unlock(&dataStream.streamLock);
 }
 
-void* deboardPassenger(void) {
-    // Dequeue a passenger from the start of the boarding line.
-    mtx_lock(&boardingQueue.boardingGateMutex);
+void* processData(void) {
+    // Extracts and processes a data packet from the stream.
+    mtx_lock(&dataStream.streamLock);
 
-    while (boardingQueue.boardingGateStart == NULL) {
-        cnd_wait(&boardingQueue.boardingQueueNotEmpty, &boardingQueue.boardingGateMutex);
+    while (!dataStream.inlet) {
+        cnd_wait(&dataStream.dataAvailable, &dataStream.streamLock);
     }
 
-    PassengerNode* passenger = boardingQueue.boardingGateStart;
-    boardingQueue.boardingGateStart = passenger->nextInLine;
-    if (boardingQueue.boardingGateStart == NULL) {
-        boardingQueue.boardingGateEnd = NULL;
+    DataPacket* packet = dataStream.inlet;
+    dataStream.inlet = packet->flowNext;
+    if (!dataStream.inlet) {
+        dataStream.outlet = NULL;
     }
 
-    void* luggage = passenger->luggage;
-    free(passenger);
+    void* payload = packet->payload;
+    free(packet);
 
-    atomic_fetch_sub(&boardingQueue.queueLength, 1);
-    atomic_fetch_add(&boardingQueue.processedPassengers, 1);
+    atomic_fetch_sub(&dataStream.streamVolume, 1);
+    atomic_fetch_add(&dataStream.processedPackets, 1);
 
-    if (boardingQueue.boardingGateStart != NULL) {
-        cnd_signal(&boardingQueue.boardingQueueNotEmpty);
+    if (dataStream.inlet) {
+        cnd_signal(&dataStream.dataAvailable);
     }
 
-    mtx_unlock(&boardingQueue.boardingGateMutex);
-    return luggage;
+    mtx_unlock(&dataStream.streamLock);
+    return payload;
 }
 
-bool tryBoardPassenger(void** luggage) {
-    // Attempt to board a passenger without delay.
-    if (mtx_trylock(&boardingQueue.boardingGateMutex) == thrd_success) {
-        if (boardingQueue.boardingGateStart == NULL) {
-            mtx_unlock(&boardingQueue.boardingGateMutex);
+bool attemptProcessData(void** payload) {
+    // Tries to process data without waiting for signal.
+    if (mtx_trylock(&dataStream.streamLock) == thrd_success) {
+        if (!dataStream.inlet) {
+            mtx_unlock(&dataStream.streamLock);
             return false;
         }
 
-        PassengerNode* tempPassenger = boardingQueue.boardingGateStart;
-        *luggage = tempPassenger->luggage;
-        boardingQueue.boardingGateStart = boardingQueue.boardingGateStart->nextInLine;
-        
-        if (boardingQueue.boardingGateStart == NULL) {
-            boardingQueue.boardingGateEnd = NULL;
+        DataPacket* packet = dataStream.inlet;
+        *payload = packet->payload;
+        dataStream.inlet = dataStream.inlet->flowNext;
+
+        if (!dataStream.inlet) {
+            dataStream.outlet = NULL;
         }
 
-        atomic_fetch_sub(&boardingQueue.queueLength, 1);
-        atomic_fetch_add(&boardingQueue.processedPassengers, 1);
+        atomic_fetch_sub(&dataStream.streamVolume, 1);
+        atomic_fetch_add(&dataStream.processedPackets, 1);
 
-        free(tempPassenger);
-        mtx_unlock(&boardingQueue.boardingGateMutex);
-
-        return true; // Successfully boarded a passenger.
+        free(packet);
+        mtx_unlock(&dataStream.streamLock);
+        return true;
     }
-
-    return false; // Boarding gate was busy, try again later.
+    return false;
 }
 
-size_t passengersWaiting(void) {
-    // Check how many passengers are currently waiting in line.
-    return atomic_load(&boardingQueue.queueLength);
+size_t currentVolume(void) {
+    // Reports the current volume of data in the stream.
+    return atomic_load(&dataStream.streamVolume);
 }
 
-size_t passengersProcessed(void) {
-    // Count how many passengers have successfully boarded.
-    return atomic_load(&boardingQueue.processedPassengers);
+size_t processorsWaiting(void) {
+    // Lists the number of processors in idle state.
+    return atomic_load(&dataStream.idleProcessors);
+}
+
+size_t packetsProcessed(void) {
+    // Counts the packets processed over time.
+    return atomic_load(&dataStream.processedPackets);
 }
