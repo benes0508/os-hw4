@@ -1,162 +1,158 @@
 #include <stdatomic.h>
 #include <threads.h>
-#include <stdlib.h>
-#include <assert.h>
-#include <stdio.h>
 #include <stdbool.h>
 #include <unistd.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <assert.h>
 
-typedef struct packet {
-    void* packet_data; 
-    struct packet* next_packet; // next packet
-} packet;
 
-typedef struct sync_node {
-    cnd_t w_sig; // cond var
-    struct sync_node* link; // next in queue
-} sync_node;
 
-typedef struct {
-    mtx_t stream_lock; //  exclusive access 
-    cnd_t is_data_avail; // Signal that data is available.
-    packet* entry_point; 
-    packet* exit_point; 
-    atomic_uint active_ticket; 
-    atomic_uint next_ticket; 
-    sync_node* first_idle; 
-    sync_node* last_idle; 
-    mtx_t sync_lock; 
-    atomic_size_t size; 
-    atomic_size_t waiting; 
-    atomic_size_t visited; 
-} big_queue;
+// we will use 2 queue method for the problematic ones
+typedef struct Node {
+    void* Meida; // Contents
+    struct Node* habaBator; // Link to the next Thrd
+} Node;
 
-big_queue queue;
+typedef struct threads 
+{
+    cnd_t waitingList; 
+    struct threads* link; 
+} threads;
 
-void initQueue(void) {
-    // some boring initilization code:
-    queue.exit_point = NULL;
-    queue.entry_point = NULL;
+// Core structure of the Data Stream Processor.
+typedef struct 
+{
+    // Entry  and- the Exit point of the data stream.
+    // Head of the waiting processors list.
+    threads* firstIdle; 
+    // Tail of the waiting processors list.
+    threads* lastIdle; 
+    Node* inlet; 
+    Node* outlet; 
+    atomic_uint activeTicket; 
+    atomic_uint nextTicket; 
+    mtx_t syncLock; // reminder --- (check what it is and delete this comment)
+    atomic_size_t streamVolume; 
+    atomic_size_t idleProcessors; 
+    // Count of processors waiting for data.
+    atomic_size_t processedThrds; 
+        // Ensures exclusive access to the data stream.
+    mtx_t streamLock; 
+    // Signal that data is present in the stream.
+    cnd_t dataAvailable; 
+} CoreStructDS;
 
-    mtx_init(&queue.stream_lock, mtx_plain);
-    cnd_init(&queue.is_data_avail);
+CoreStructDS dataQueue;
 
-    atomic_store(&queue.visited, 0);
-    atomic_store(&queue.size, 0);
-    atomic_store(&queue.waiting, 0);
-    queue.last_idle = NULL;
-    queue.first_idle = NULL;
+size_t size(void) {return atomic_load(&dataQueue.streamVolume);}
+size_t waiting(void) {return atomic_load(&dataQueue.idleProcessors);}
+size_t visited(void) {return atomic_load(&dataQueue.processedThrds);}
 
-    mtx_init(&queue.sync_lock, mtx_plain);
+void initQueue(void)
+ {
+    dataQueue.outlet = NULL;
+    dataQueue.inlet = NULL;
+    
+    
+    // check mtx does
+    mtx_init(&dataQueue.streamLock, mtx_plain);
+    cnd_init(&dataQueue.dataAvailable);
 
-    atomic_store(&queue.next_ticket, 0);
-    atomic_store(&queue.active_ticket, 0);
+    // atomic 
+    atomic_store(&dataQueue.processedThrds, 0);
+    atomic_store(&dataQueue.streamVolume, 0);
+    atomic_store(&dataQueue.idleProcessors, 0);
+
+
+    // set to null the first and last data Streaming :::::: 
+    dataQueue.lastIdle = NULL;
+    dataQueue.firstIdle = NULL;
+
+
+    mtx_init(&dataQueue.syncLock, mtx_plain);
+
+    //atomic
+    atomic_store(&dataQueue.nextTicket, 0);
+    atomic_store(&dataQueue.activeTicket, 0);
 }
 
 void destroyQueue(void) {
-    // do not hog the computers memory! #freeMemory
-    packet* curr = queue.entry_point;
-    while (curr) 
-    {
-        // while curr is not null, free the packets
-        packet* rel = curr; // packet to release
-        curr = curr->next_packet;
-        free(rel);
+    // free all the memory, destory the queue and destroy mtx both things that needed. lock sync and all this
+    Node* currentThrd = dataQueue.inlet;
+    while (currentThrd) {
+        Node* toRelease = currentThrd;
+        currentThrd = currentThrd->habaBator;
+        free(toRelease);
     }
-
-    sync_node* curr_sync_node = queue.first_idle;
-    while (curr_sync_node) {
-        sync_node* clean_node = curr_sync_node;
-        curr_sync_node = curr_sync_node->link;
-        cnd_destroy(&clean_node->w_sig);
-        free(clean_node);
+    threads* currentSyncNode = dataQueue.firstIdle;
+    while (currentSyncNode) {
+        threads* toClean = currentSyncNode;
+        currentSyncNode = currentSyncNode->link;
+        cnd_destroy(&toClean->waitingList);
+        free(toClean); // free !
     }
+    cnd_destroy(&dataQueue.dataAvailable);
 
-    mtx_destroy(&queue.stream_lock);
-    cnd_destroy(&queue.is_data_avail);
-    mtx_destroy(&queue.sync_lock);
+    mtx_destroy(&dataQueue.streamLock);
+    
+    mtx_destroy(&dataQueue.syncLock);
 }
 
-void enqueue(void* packet_data) {
-    // add to queue
-    packet* new_packet = malloc(sizeof(packet)); // Assuming malloc does not fail :)
-
-    new_packet->packet_data = packet_data;
-    new_packet->next_packet = NULL;
-    mtx_lock(&queue.stream_lock);
-
-    if (!queue.exit_point) 
-    {
-        queue.entry_point = queue.exit_point = new_packet;
-        cnd_signal(&queue.is_data_avail);
+void enqueue(void* Meida) {
+    // Introduces a new data Thrd into the stream.
+    Node* newThrd = malloc(sizeof(Node));
+    // setup
+    newThrd->Meida = Meida;
+    newThrd->habaBator = NULL;
+    mtx_lock(&dataQueue.streamLock);
+    if (!dataQueue.outlet) {
+        dataQueue.inlet = dataQueue.outlet = newThrd;
+        cnd_signal(&dataQueue.dataAvailable);
+    } else {
+        dataQueue.outlet->habaBator = newThrd;
+        dataQueue.outlet = newThrd;
     }
-     else 
-     {
-        queue.exit_point->next_packet = new_packet;
-        queue.exit_point = new_packet;
-    }
-    atomic_fetch_add(&queue.size, 1);
-    mtx_unlock(&queue.stream_lock);
+    atomic_fetch_add(&dataQueue.streamVolume, 1);
+    mtx_unlock(&dataQueue.streamLock);
 }
 
 void* dequeue(void) {
-    mtx_lock(&queue.stream_lock);
-    while (!queue.entry_point) 
-    {
-        cnd_wait(&queue.is_data_avail, &queue.stream_lock);
-    }
-    packet* packet = queue.entry_point;
-    queue.entry_point = packet->next_packet;
-    if (!queue.entry_point) 
-    {
-        queue.exit_point = NULL;
-    }
-    void* packet_data = packet->packet_data;
-    free(packet);
-    atomic_fetch_sub(&queue.size, 1);
-    atomic_fetch_add(&queue.visited, 1);
-    if (queue.entry_point) 
-    {
-        cnd_signal(&queue.is_data_avail);
-    }
-    mtx_unlock(&queue.stream_lock);
-    return packet_data;
+    // Extracts and processes a data Thrd from the stream.
+    mtx_lock(&dataQueue.streamLock);
+    while (!dataQueue.inlet) {cnd_wait(&dataQueue.dataAvailable, &dataQueue.streamLock);}
+    Node* Thrd = dataQueue.inlet;
+    dataQueue.inlet = Thrd->habaBator;
+    if (!dataQueue.inlet) {dataQueue.outlet = NULL;}
+    void* Meida = Thrd->Meida;
+    // never forget to free!!!! segmentation was a pain 
+    free(Thrd); // free it
+    atomic_fetch_sub(&dataQueue.streamVolume, 1);
+    atomic_fetch_add(&dataQueue.processedThrds, 1);
+    if (dataQueue.inlet) {cnd_signal(&dataQueue.dataAvailable);}
+    mtx_unlock(&dataQueue.streamLock);
+    return Meida;
 }
-
-bool tryDequeue(void** packet_data) {
-    if (mtx_trylock(&queue.stream_lock) == thrd_success) 
-    {
-        if (!queue.entry_point) 
-        {
-            mtx_unlock(&queue.stream_lock);
+// try Dequeiue function implment : 
+bool tryDequeue(void** Meida) {
+    // lets try to process data without waiting for signal.
+    if (mtx_trylock(&dataQueue.streamLock) == thrd_success) {
+        if (!dataQueue.inlet) {
+            mtx_unlock(&dataQueue.streamLock);
             return false;
         }
-        packet* packet = queue.entry_point;
-        *packet_data = packet->packet_data;
-        queue.entry_point = queue.entry_point->next_packet;
-        if (!queue.entry_point) 
-        { 
-            queue.exit_point = NULL;
-        }
-        atomic_fetch_sub(&queue.size, 1);
-        atomic_fetch_add(&queue.visited, 1);
-        free(packet);
-        mtx_unlock(&queue.stream_lock);
+    // continue
+        Node* baseNode = dataQueue.inlet;
+        *Meida = baseNode->Meida;
+        dataQueue.inlet = dataQueue.inlet->habaBator;
+        if (!dataQueue.inlet) {dataQueue.outlet = NULL;}
+        atomic_fetch_sub(&dataQueue.streamVolume, 1);
+        atomic_fetch_add(&dataQueue.processedThrds, 1);
+        // free base node ::
+        free(baseNode);
+        //mtx thig;
+        mtx_unlock(&dataQueue.streamLock);
         return true;
     }
     return false;
-}
-
-// and now, for the easy part of the assignment:
-size_t size(void) 
-{
-    return atomic_load(&queue.size);
-}
-size_t visited(void) 
-{
-    return atomic_load(&queue.visited);
-}
-size_t waiting(void) 
-{
-    return atomic_load(&queue.waiting);
 }
