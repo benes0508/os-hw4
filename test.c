@@ -9,7 +9,7 @@
 #define MAX_SIZE 1000
 #define NUM_THREADS_CONC 100
 #define NUM_THREADS 50
-#define SECOND_IN_NANOSECONDS 1000000000
+#define SECOND_IN_NANOSECONDS 10000000000
 
 int dequeue_with_sleep(void *arg);
 int enqueueItems(void *arg);
