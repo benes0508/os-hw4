@@ -9,15 +9,12 @@ typedef struct Node {
 } Node;
 
 typedef struct {
-    mtx_t lock;
-    cnd_t has_items;
     Node* head;
     Node* tail;
+    mtx_t lock;
+    cnd_t not_empty;
     atomic_size_t size;
     atomic_size_t visited;
-    atomic_size_t waiting;
-    atomic_uint current_ticket;
-    atomic_uint next_ticket;
 } ConcurrentQueue;
 
 ConcurrentQueue queue;
@@ -26,24 +23,22 @@ void initQueue(void) {
     queue.head = NULL;
     queue.tail = NULL;
     mtx_init(&queue.lock, mtx_plain);
-    cnd_init(&queue.has_items);
+    cnd_init(&queue.not_empty);
     atomic_store(&queue.size, 0);
     atomic_store(&queue.visited, 0);
-    atomic_store(&queue.waiting, 0);
-    atomic_store(&queue.current_ticket, 0);
-    atomic_store(&queue.next_ticket, 0);
 }
 
 void destroyQueue(void) {
-    Node* node = queue.head;
-    while (node) {
-        Node* tmp = node;
-        node = node->next;
-        free(tmp);
+    Node* current;
+    mtx_lock(&queue.lock);
+    while ((current = queue.head) != NULL) {
+        queue.head = current->next;
+        free(current);
     }
-
+    queue.tail = NULL;
+    mtx_unlock(&queue.lock);
     mtx_destroy(&queue.lock);
-    cnd_destroy(&queue.has_items);
+    cnd_destroy(&queue.not_empty);
 }
 
 void enqueue(void* item) {
@@ -52,84 +47,34 @@ void enqueue(void* item) {
     newNode->next = NULL;
 
     mtx_lock(&queue.lock);
-
-    if (!queue.tail) {
-        queue.head = newNode;
-    } else {
+    if (queue.tail) {
         queue.tail->next = newNode;
+    } else {
+        queue.head = newNode;
     }
     queue.tail = newNode;
-
     atomic_fetch_add(&queue.size, 1);
-
-    cnd_broadcast(&queue.has_items);
-
+    cnd_signal(&queue.not_empty);
     mtx_unlock(&queue.lock);
 }
 
 void* dequeue(void) {
-    unsigned int my_ticket = atomic_fetch_add(&queue.next_ticket, 1);
-
     mtx_lock(&queue.lock);
-
-    while (queue.head == NULL || my_ticket != atomic_load(&queue.current_ticket)) {
-        atomic_fetch_add(&queue.waiting, 1);
-        cnd_wait(&queue.has_items, &queue.lock);
-        atomic_fetch_sub(&queue.waiting, 1);
+    while (!queue.head) {
+        cnd_wait(&queue.not_empty, &queue.lock);
     }
-
-    Node* node = queue.head;
-    void* item = node->data;
-    queue.head = node->next;
-
+    Node* temp = queue.head;
+    queue.head = queue.head->next;
     if (!queue.head) {
         queue.tail = NULL;
     }
-
-    free(node);
+    void* item = temp->data;
+    free(temp);
     atomic_fetch_sub(&queue.size, 1);
     atomic_fetch_add(&queue.visited, 1);
-    atomic_fetch_add(&queue.current_ticket, 1);
-
-    cnd_broadcast(&queue.has_items); // Notify any waiting threads to check their tickets.
-
     mtx_unlock(&queue.lock);
     return item;
 }
-
-
-bool tryDequeue(void** item) {
-    if (mtx_trylock(&queue.lock) == thrd_success) {
-        // Check if the queue is not empty and if the calling thread has the correct ticket
-        if (queue.head && atomic_load(&queue.current_ticket) == atomic_load(&queue.next_ticket)) {
-            Node* node = queue.head;
-            *item = node->data;
-            queue.head = node->next;
-
-            if (!queue.head) {
-                queue.tail = NULL;
-            }
-
-            free(node);
-            atomic_fetch_sub(&queue.size, 1);
-            atomic_fetch_add(&queue.visited, 1);
-            atomic_fetch_add(&queue.current_ticket, 1);
-
-            // Since we've successfully dequeued, we need to update the next ticket
-            // However, this isn't typically how tryDequeue would handle tickets because it doesn't 'wait'.
-            // If another thread holds the next ticket, this won't enforce proper turn order without waiting.
-            
-            mtx_unlock(&queue.lock);
-            return true;
-        } else {
-            mtx_unlock(&queue.lock);
-            return false;
-        }
-    }
-
-    return false;
-}
-
 
 size_t size(void) {
     return atomic_load(&queue.size);
@@ -137,8 +82,4 @@ size_t size(void) {
 
 size_t visited(void) {
     return atomic_load(&queue.visited);
-}
-
-size_t waiting(void) {
-    return atomic_load(&queue.waiting);
 }
