@@ -311,7 +311,6 @@ int dequeue_with_sleep(void *arg)
 
     return 0;
 }
-
 void test_fifo_order() {
     printf("=== Testing FIFO order ===\n");
 
