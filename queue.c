@@ -6,130 +6,127 @@
 #include <unistd.h>
 #include <assert.h>
 
-// Renamed structure for queue items.
-typedef struct Node {
-    void* content; // Pointer to the item's data.
-    struct Node* follow; // Next item in the queue.
-} Node;
+// Renamed structure for each item in the queue.
+typedef struct DataNode {
+    void* item; // The data stored in this node.
+    struct DataNode* nextNode; // Pointer to the next node in the queue.
+} DataNode;
 
-// Renamed structure for managing waiting threads.
-typedef struct SleepNode {
-    cnd_t condition; // Condition variable for this sleeping thread.
-    struct SleepNode* next; // Next node in the list of sleeping threads.
-} SleepNode;
+// Renamed structure for managing threads that are waiting.
+typedef struct WaitNode {
+    cnd_t waitCond; // Condition variable for waiting.
+    struct WaitNode* nextWait; // Next waiting thread node.
+} WaitNode;
 
-// Renamed main queue structure with detailed variable names for clarity.
+// Renamed main structure for the queue.
 typedef struct {
-    Node* front; // Pointer to the first item in the queue.
-    Node* back; // Pointer to the last item in the queue.
-    mtx_t lock; // Mutex for synchronizing access to the queue.
-    cnd_t hasItems; // Condition variable to signal when items are added.
-    atomic_size_t itemCount; // Total number of items in the queue.
-    atomic_size_t waitCount; // Number of threads currently waiting for an item.
-    atomic_size_t processedCount; // Total number of items that have been processed.
-    SleepNode* sleepFront; // Pointer to the first sleeping thread node.
-    SleepNode* sleepBack; // Pointer to the last sleeping thread node.
-    mtx_t sleepLock; // Mutex for synchronizing access to the sleeping threads list.
-} ManagedQueue;
+    DataNode* first; // Start of the queue.
+    DataNode* last; // End of the queue.
+    mtx_t lockQueue; // Mutex for synchronizing access to the queue.
+    cnd_t notEmptyCond; // Condition variable to wait on when queue is empty.
+    atomic_size_t queueSize; // Number of items in the queue.
+    atomic_size_t threadsWaiting; // Count of threads waiting for an item.
+    atomic_size_t itemsProcessed; // Count of items that have been processed.
+    WaitNode* firstWait; // Start of the list of waiting threads.
+    WaitNode* lastWait; // End of the list of waiting threads.
+} SyncQueue;
 
-ManagedQueue queue;
+SyncQueue syncQueue;
 
 void initQueue(void) {
-    queue.front = queue.back = NULL;
-    mtx_init(&queue.lock, mtx_plain);
-    cnd_init(&queue.hasItems);
-    atomic_store(&queue.itemCount, 0);
-    atomic_store(&queue.waitCount, 0);
-    atomic_store(&queue.processedCount, 0);
-    queue.sleepFront = queue.sleepBack = NULL;
-    mtx_init(&queue.sleepLock, mtx_plain);
+    syncQueue.first = NULL;
+    syncQueue.last = NULL;
+    mtx_init(&syncQueue.lockQueue, mtx_plain);
+    cnd_init(&syncQueue.notEmptyCond);
+    atomic_store(&syncQueue.queueSize, 0);
+    atomic_store(&syncQueue.threadsWaiting, 0);
+    atomic_store(&syncQueue.itemsProcessed, 0);
+    syncQueue.firstWait = NULL;
+    syncQueue.lastWait = NULL;
 }
 
 void destroyQueue(void) {
-    Node* current = queue.front;
-    while (current != NULL) {
-        Node* toDelete = current;
-        current = current->follow;
-        free(toDelete);
+    DataNode* current = syncQueue.first;
+    while (current) {
+        DataNode* temp = current;
+        current = current->nextNode;
+        free(temp); // Free each node.
+    }
+    
+    WaitNode* currentWait = syncQueue.firstWait;
+    while (currentWait) {
+        WaitNode* tempWait = currentWait;
+        currentWait = currentWait->nextWait;
+        cnd_destroy(&tempWait->waitCond); // Clean up each waiting node.
+        free(tempWait);
     }
 
-    SleepNode* waitCurrent = queue.sleepFront;
-    while (waitCurrent != NULL) {
-        SleepNode* toDelete = waitCurrent;
-        waitCurrent = waitCurrent->next;
-        cnd_destroy(&toDelete->condition);
-        free(toDelete);
-    }
-
-    mtx_destroy(&queue.lock);
-    cnd_destroy(&queue.hasItems);
-    mtx_destroy(&queue.sleepLock);
+    mtx_destroy(&syncQueue.lockQueue);
+    cnd_destroy(&syncQueue.notEmptyCond);
 }
 
-void enqueue(void* data) {
-    Node* newNode = malloc(sizeof(Node));
-    newNode->content = data;
-    newNode->follow = NULL;
+void enqueue(void* item) {
+    DataNode* newNode = malloc(sizeof(DataNode));
+    newNode->item = item;
+    newNode->nextNode = NULL;
 
-    mtx_lock(&queue.lock);
-    
-    if (queue.back == NULL) {
-        queue.front = queue.back = newNode;
+    mtx_lock(&syncQueue.lockQueue);
+
+    if (syncQueue.last == NULL) {
+        syncQueue.first = syncQueue.last = newNode;
     } else {
-        queue.back->follow = newNode;
-        queue.back = newNode;
+        syncQueue.last->nextNode = newNode;
+        syncQueue.last = newNode;
     }
 
-    atomic_fetch_add(&queue.itemCount, 1);
-    cnd_signal(&queue.hasItems);
+    atomic_fetch_add(&syncQueue.queueSize, 1);
+    cnd_signal(&syncQueue.notEmptyCond);
 
-    mtx_unlock(&queue.lock);
+    mtx_unlock(&syncQueue.lockQueue);
 }
 
 void* dequeue(void) {
-    mtx_lock(&queue.lock);
+    mtx_lock(&syncQueue.lockQueue);
 
-    while (queue.front == NULL) {
-        cnd_wait(&queue.hasItems, &queue.lock);
+    while (syncQueue.first == NULL) {
+        cnd_wait(&syncQueue.notEmptyCond, &syncQueue.lockQueue);
     }
 
-    Node* nodeToRemove = queue.front;
-    void* data = nodeToRemove->content;
-    queue.front = queue.front->follow;
-    
-    if (queue.front == NULL) {
-        queue.back = NULL;
+    DataNode* node = syncQueue.first;
+    syncQueue.first = node->nextNode;
+    if (syncQueue.first == NULL) {
+        syncQueue.last = NULL;
     }
 
-    atomic_fetch_sub(&queue.itemCount, 1);
-    atomic_fetch_add(&queue.processedCount, 1);
+    void* item = node->item;
+    free(node);
 
-    free(nodeToRemove);
+    atomic_fetch_sub(&syncQueue.queueSize, 1);
+    atomic_fetch_add(&syncQueue.itemsProcessed, 1);
 
-    mtx_unlock(&queue.lock);
-    return data;
+    mtx_unlock(&syncQueue.lockQueue);
+    return item;
 }
 
-bool tryDequeue(void** data) {
-    if (mtx_trylock(&queue.lock) == thrd_success) {
-        if (queue.front == NULL) {
-            mtx_unlock(&queue.lock);
+bool tryDequeue(void** item) {
+    if (mtx_trylock(&syncQueue.lockQueue) == thrd_success) {
+        if (syncQueue.first == NULL) {
+            mtx_unlock(&syncQueue.lockQueue);
             return false;
         }
 
-        Node* nodeToRemove = queue.front;
-        *data = nodeToRemove->content;
-        queue.front = queue.front->follow;
-        
-        if (queue.front == NULL) {
-            queue.back = NULL;
+        DataNode* node = syncQueue.first;
+        *item = node->item;
+        syncQueue.first = node->nextNode;
+        if (syncQueue.first == NULL) {
+            syncQueue.last = NULL;
         }
 
-        atomic_fetch_sub(&queue.itemCount, 1);
-        atomic_fetch_add(&queue.processedCount, 1);
+        atomic_fetch_sub(&syncQueue.queueSize, 1);
+        atomic_fetch_add(&syncQueue.itemsProcessed, 1);
 
-        free(nodeToRemove);
-        mtx_unlock(&queue.lock);
+        free(node);
+        mtx_unlock(&syncQueue.lockQueue);
         return true;
     }
 
@@ -137,13 +134,13 @@ bool tryDequeue(void** data) {
 }
 
 size_t size(void) {
-    return atomic_load(&queue.itemCount);
+    return atomic_load(&syncQueue.queueSize);
 }
 
 size_t waiting(void) {
-    return atomic_load(&queue.waitCount);
+    return atomic_load(&syncQueue.threadsWaiting);
 }
 
 size_t visited(void) {
-    return atomic_load(&queue.processedCount);
+    return atomic_load(&syncQueue.itemsProcessed);
 }
