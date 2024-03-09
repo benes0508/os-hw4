@@ -2,6 +2,7 @@
 #include <stdbool.h>
 #include <threads.h>
 #include <stdatomic.h>
+#include <semaphore.h>
 
 typedef struct Node {
     void* data;
@@ -12,7 +13,7 @@ typedef struct {
     Node* head;
     Node* tail;
     mtx_t lock;
-    cnd_t not_empty;
+    sem_t items_available;  // Semaphore to signal available items
     atomic_size_t size;
     atomic_size_t visited;
     atomic_size_t waiting;  // To keep track of the waiting threads.
@@ -24,7 +25,7 @@ void initQueue(void) {
     queue.head = NULL;
     queue.tail = NULL;
     mtx_init(&queue.lock, mtx_plain);
-    cnd_init(&queue.not_empty);
+    sem_init(&queue.items_available, 0, 0);  // Initialize semaphore with 0
     atomic_store(&queue.size, 0);
     atomic_store(&queue.visited, 0);
     atomic_store(&queue.waiting, 0);  // Initialize waiting count.
@@ -40,7 +41,7 @@ void destroyQueue(void) {
     queue.tail = NULL;
     mtx_unlock(&queue.lock);
     mtx_destroy(&queue.lock);
-    cnd_destroy(&queue.not_empty);
+    sem_destroy(&queue.items_available);
 }
 
 void enqueue(void* item) {
@@ -57,36 +58,26 @@ void enqueue(void* item) {
     queue.tail = newNode;
     atomic_fetch_add(&queue.size, 1);
     if (atomic_load(&queue.waiting) > 0) {
-        cnd_signal(&queue.not_empty);
+        sem_post(&queue.items_available);  // Signal available item
     }
     mtx_unlock(&queue.lock);
 }
 
 void* dequeue(void) {
+    sem_wait(&queue.items_available);  // Wait for available item
     mtx_lock(&queue.lock);
-    while (!queue.head) {
-        atomic_fetch_add(&queue.waiting, 1);
-        cnd_wait(&queue.not_empty, &queue.lock);
-        atomic_fetch_sub(&queue.waiting, 1);
-    }
     Node* node = queue.head;
-    void* item = node->data;
     queue.head = node->next;
     if (!queue.head) {
         queue.tail = NULL;
     }
+    void* item = node->data;
+    free(node);
     atomic_fetch_sub(&queue.size, 1);
     atomic_fetch_add(&queue.visited, 1);
-    if (atomic_load(&queue.waiting) > 0) {
-        cnd_signal(&queue.not_empty);
-    }
     mtx_unlock(&queue.lock);
-    free(node); // Free the node after unlocking the mutex
     return item;
 }
-
-
-
 
 bool tryDequeue(void** item) {
     if (mtx_trylock(&queue.lock) != thrd_success) {
