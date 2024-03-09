@@ -61,6 +61,7 @@ void destroyQueue(void) {
 
 void enqueue(void* item) {
     mtx_lock(&queue.lock);
+    
     Node* newNode = malloc(sizeof(Node));
     newNode->data = item;
     newNode->next = NULL;
@@ -71,16 +72,15 @@ void enqueue(void* item) {
         queue.head = newNode;
     }
     queue.tail = newNode;
-    atomic_fetch_add(&queue.size, 1);
-
+    
     if (queue.waitHead) {
-        // Signal the first waiting thread only.
-        cnd_signal(&queue.waitHead->cond);
+        cnd_signal(&queue.waitHead->cond);  // Signal the first waiting thread.
+    } else {
+        atomic_fetch_add(&queue.size, 1);
     }
-
+    
     mtx_unlock(&queue.lock);
 }
-
 void* dequeue(void) {
     mtx_lock(&queue.lock);
 
@@ -104,17 +104,6 @@ void* dequeue(void) {
         atomic_fetch_add(&queue.waiting, 1);
         cnd_wait(&queue.waitHead->cond, &queue.lock);
         atomic_fetch_sub(&queue.waiting, 1);
-
-        // Move to the next waiting node after current node is done waiting.
-        if (queue.waitHead) {
-            WaitNode* temp = queue.waitHead;
-            queue.waitHead = queue.waitHead->next;
-            if (!queue.waitHead) {
-                queue.waitTail = NULL;
-            }
-            cnd_destroy(&temp->cond);
-            free(temp);
-        }
     }
 
     Node* node = queue.head;
@@ -126,13 +115,18 @@ void* dequeue(void) {
         }
         item = node->data;
         free(node);
+    }
+
+    if (queue.waitHead) {
+        cnd_signal(&queue.waitHead->cond);  // Signal next waiting thread, if any.
+    } else {
         atomic_fetch_sub(&queue.size, 1);
-        atomic_fetch_add(&queue.visited, 1);
     }
 
     mtx_unlock(&queue.lock);
     return item;
 }
+
 
 // The rest of your functions (tryDequeue, size, waiting, visited) remain the same.
 
