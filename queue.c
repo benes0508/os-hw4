@@ -15,7 +15,9 @@ typedef struct {
     Node* tail;
     atomic_size_t size;
     atomic_size_t visited;
-    atomic_size_t waiting; // Track the number of waiting threads.
+    atomic_size_t waiting;
+    atomic_uint current_ticket;
+    atomic_uint next_ticket;
 } ConcurrentQueue;
 
 ConcurrentQueue queue;
@@ -27,7 +29,9 @@ void initQueue(void) {
     cnd_init(&queue.has_items);
     atomic_store(&queue.size, 0);
     atomic_store(&queue.visited, 0);
-    atomic_store(&queue.waiting, 0); // Initialize waiting threads count.
+    atomic_store(&queue.waiting, 0);
+    atomic_store(&queue.current_ticket, 0);
+    atomic_store(&queue.next_ticket, 0);
 }
 
 void destroyQueue(void) {
@@ -57,19 +61,18 @@ void enqueue(void* item) {
     queue.tail = newNode;
 
     atomic_fetch_add(&queue.size, 1);
-    
-    // If there are any waiting threads, wake one up.
-    if (atomic_load(&queue.waiting) > 0) {
-        cnd_signal(&queue.has_items);
-    }
+
+    cnd_broadcast(&queue.has_items);
 
     mtx_unlock(&queue.lock);
 }
 
 void* dequeue(void) {
+    unsigned int my_ticket = atomic_fetch_add(&queue.next_ticket, 1);
+
     mtx_lock(&queue.lock);
 
-    while (queue.head == NULL) {
+    while (queue.head == NULL || my_ticket != atomic_load(&queue.current_ticket)) {
         atomic_fetch_add(&queue.waiting, 1);
         cnd_wait(&queue.has_items, &queue.lock);
         atomic_fetch_sub(&queue.waiting, 1);
@@ -86,6 +89,9 @@ void* dequeue(void) {
     free(node);
     atomic_fetch_sub(&queue.size, 1);
     atomic_fetch_add(&queue.visited, 1);
+    atomic_fetch_add(&queue.current_ticket, 1);
+
+    cnd_broadcast(&queue.has_items); // Notify any waiting threads to check their tickets.
 
     mtx_unlock(&queue.lock);
     return item;
@@ -93,7 +99,7 @@ void* dequeue(void) {
 
 bool tryDequeue(void** item) {
     if (mtx_trylock(&queue.lock) == thrd_success) {
-        if (!queue.head) {
+        if (!queue.head || atomic_load(&queue.current_ticket) != atomic_load(&queue.next_ticket)) {
             mtx_unlock(&queue.lock);
             return false;
         }
@@ -109,6 +115,7 @@ bool tryDequeue(void** item) {
         free(node);
         atomic_fetch_sub(&queue.size, 1);
         atomic_fetch_add(&queue.visited, 1);
+        atomic_fetch_add(&queue.current_ticket, 1); // This is important even for tryDequeue.
 
         mtx_unlock(&queue.lock);
         return true;
@@ -126,6 +133,5 @@ size_t visited(void) {
 }
 
 size_t waiting(void) {
-    // Return the number of waiting threads.
     return atomic_load(&queue.waiting);
 }
