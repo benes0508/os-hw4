@@ -1,169 +1,162 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <threads.h>
 #include <stdatomic.h>
+#include <threads.h>
+#include <stdlib.h>
+#include <assert.h>
+#include <stdio.h>
 #include <stdbool.h>
 #include <unistd.h>
-#include <assert.h>
 
-// Data Packet Node in the Stream.
-typedef struct DataPacket {
-    void* payload; // Contents of this packet.
-    struct DataPacket* flowNext; // Link to the next packet in the stream.
-} DataPacket;
+typedef struct packet {
+    void* packet_data; 
+    struct packet* next_packet; // next packet
+} packet;
 
-// For synchronizing data flow processors awaiting tasks.
-typedef struct ProcessorSyncNode {
-    cnd_t awaitSignal; // Signal for processors to synchronize.
-    struct ProcessorSyncNode* link; // Chain to the next node.
-} ProcessorSyncNode;
+typedef struct sync_node {
+    cnd_t w_sig; // cond var
+    struct sync_node* link; // next in queue
+} sync_node;
 
-// Core structure of the Data Stream Processor.
 typedef struct {
-    DataPacket* inlet; // Entry point of the data stream.
-    DataPacket* outlet; // Exit point of the data stream.
-    mtx_t streamLock; // Ensures exclusive access to the data stream.
-    cnd_t dataAvailable; // Signal that data is present in the stream.
-    atomic_size_t streamVolume; // Quantity of data packets in the stream.
-    atomic_size_t idleProcessors; // Count of processors waiting for data.
-    atomic_size_t processedPackets; // Tally of processed data packets.
-    ProcessorSyncNode* firstIdle; // Head of the waiting processors list.
-    ProcessorSyncNode* lastIdle; // Tail of the waiting processors list.
-    mtx_t syncLock; // Lock for coordinating the idle processors.
-    atomic_uint activeTicket; // Currently active processing ticket.
-    atomic_uint nextTicket; // Ticket for the next processing sequence.
-} DataStreamProcessor;
+    mtx_t stream_lock; //  exclusive access 
+    cnd_t is_data_avail; // Signal that data is available.
+    packet* entry_point; 
+    packet* exit_point; 
+    atomic_uint active_ticket; 
+    atomic_uint next_ticket; 
+    sync_node* first_idle; 
+    sync_node* last_idle; 
+    mtx_t sync_lock; 
+    atomic_size_t size; 
+    atomic_size_t waiting; 
+    atomic_size_t visited; 
+} big_queue;
 
-DataStreamProcessor dataStream;
+big_queue queue;
 
 void initQueue(void) {
-    // Prepares the data stream for operation.
-    dataStream.inlet = NULL;
-    dataStream.outlet = NULL;
-    mtx_init(&dataStream.streamLock, mtx_plain);
-    cnd_init(&dataStream.dataAvailable);
-    atomic_store(&dataStream.streamVolume, 0);
-    atomic_store(&dataStream.idleProcessors, 0);
-    atomic_store(&dataStream.processedPackets, 0);
-    dataStream.firstIdle = NULL;
-    dataStream.lastIdle = NULL;
-    mtx_init(&dataStream.syncLock, mtx_plain);
-    atomic_store(&dataStream.activeTicket, 0);
-    atomic_store(&dataStream.nextTicket, 0);
+    // some boring initilization code:
+    queue.exit_point = NULL;
+    queue.entry_point = NULL;
+
+    mtx_init(&queue.stream_lock, mtx_plain);
+    cnd_init(&queue.is_data_avail);
+
+    atomic_store(&queue.visited, 0);
+    atomic_store(&queue.size, 0);
+    atomic_store(&queue.waiting, 0);
+    queue.last_idle = NULL;
+    queue.first_idle = NULL;
+
+    mtx_init(&queue.sync_lock, mtx_plain);
+
+    atomic_store(&queue.next_ticket, 0);
+    atomic_store(&queue.active_ticket, 0);
 }
 
 void destroyQueue(void) {
-    // Deactivates the data stream and cleans up.
-    DataPacket* currentPacket = dataStream.inlet;
-    while (currentPacket) {
-        DataPacket* toRelease = currentPacket;
-        currentPacket = currentPacket->flowNext;
-        free(toRelease);
+    // do not hog the computers memory! #freeMemory
+    packet* curr = queue.entry_point;
+    while (curr) 
+    {
+        // while curr is not null, free the packets
+        packet* rel = curr; // packet to release
+        curr = curr->next_packet;
+        free(rel);
     }
 
-    ProcessorSyncNode* currentSyncNode = dataStream.firstIdle;
-    while (currentSyncNode) {
-        ProcessorSyncNode* toClean = currentSyncNode;
-        currentSyncNode = currentSyncNode->link;
-        cnd_destroy(&toClean->awaitSignal);
-        free(toClean);
+    sync_node* curr_sync_node = queue.first_idle;
+    while (curr_sync_node) {
+        sync_node* clean_node = curr_sync_node;
+        curr_sync_node = curr_sync_node->link;
+        cnd_destroy(&clean_node->w_sig);
+        free(clean_node);
     }
 
-    mtx_destroy(&dataStream.streamLock);
-    cnd_destroy(&dataStream.dataAvailable);
-    mtx_destroy(&dataStream.syncLock);
+    mtx_destroy(&queue.stream_lock);
+    cnd_destroy(&queue.is_data_avail);
+    mtx_destroy(&queue.sync_lock);
 }
 
-void enqueue(void* payload) {
-    // Introduces a new data packet into the stream.
-    DataPacket* newPacket = malloc(sizeof(DataPacket));
-    if (!newPacket) {
-        fprintf(stderr, "Allocation error: Failed to create new data packet.\n");
-        return;
+void enqueue(void* packet_data) {
+    // add to queue
+    packet* new_packet = malloc(sizeof(packet)); // Assuming malloc does not fail :)
+
+    new_packet->packet_data = packet_data;
+    new_packet->next_packet = NULL;
+    mtx_lock(&queue.stream_lock);
+
+    if (!queue.exit_point) 
+    {
+        queue.entry_point = queue.exit_point = new_packet;
+        cnd_signal(&queue.is_data_avail);
     }
-    newPacket->payload = payload;
-    newPacket->flowNext = NULL;
-
-    mtx_lock(&dataStream.streamLock);
-
-    if (!dataStream.outlet) {
-        dataStream.inlet = dataStream.outlet = newPacket;
-        cnd_signal(&dataStream.dataAvailable);
-    } else {
-        dataStream.outlet->flowNext = newPacket;
-        dataStream.outlet = newPacket;
+     else 
+     {
+        queue.exit_point->next_packet = new_packet;
+        queue.exit_point = new_packet;
     }
-
-    atomic_fetch_add(&dataStream.streamVolume, 1);
-
-    mtx_unlock(&dataStream.streamLock);
+    atomic_fetch_add(&queue.size, 1);
+    mtx_unlock(&queue.stream_lock);
 }
 
 void* dequeue(void) {
-    // Extracts and processes a data packet from the stream.
-    mtx_lock(&dataStream.streamLock);
-
-    while (!dataStream.inlet) {
-        cnd_wait(&dataStream.dataAvailable, &dataStream.streamLock);
+    mtx_lock(&queue.stream_lock);
+    while (!queue.entry_point) 
+    {
+        cnd_wait(&queue.is_data_avail, &queue.stream_lock);
     }
-
-    DataPacket* packet = dataStream.inlet;
-    dataStream.inlet = packet->flowNext;
-    if (!dataStream.inlet) {
-        dataStream.outlet = NULL;
+    packet* packet = queue.entry_point;
+    queue.entry_point = packet->next_packet;
+    if (!queue.entry_point) 
+    {
+        queue.exit_point = NULL;
     }
-
-    void* payload = packet->payload;
+    void* packet_data = packet->packet_data;
     free(packet);
-
-    atomic_fetch_sub(&dataStream.streamVolume, 1);
-    atomic_fetch_add(&dataStream.processedPackets, 1);
-
-    if (dataStream.inlet) {
-        cnd_signal(&dataStream.dataAvailable);
+    atomic_fetch_sub(&queue.size, 1);
+    atomic_fetch_add(&queue.visited, 1);
+    if (queue.entry_point) 
+    {
+        cnd_signal(&queue.is_data_avail);
     }
-
-    mtx_unlock(&dataStream.streamLock);
-    return payload;
+    mtx_unlock(&queue.stream_lock);
+    return packet_data;
 }
 
-bool tryDequeue(void** payload) {
-    // Tries to process data without waiting for signal.
-    if (mtx_trylock(&dataStream.streamLock) == thrd_success) {
-        if (!dataStream.inlet) {
-            mtx_unlock(&dataStream.streamLock);
+bool tryDequeue(void** packet_data) {
+    if (mtx_trylock(&queue.stream_lock) == thrd_success) 
+    {
+        if (!queue.entry_point) 
+        {
+            mtx_unlock(&queue.stream_lock);
             return false;
         }
-
-        DataPacket* packet = dataStream.inlet;
-        *payload = packet->payload;
-        dataStream.inlet = dataStream.inlet->flowNext;
-
-        if (!dataStream.inlet) {
-            dataStream.outlet = NULL;
+        packet* packet = queue.entry_point;
+        *packet_data = packet->packet_data;
+        queue.entry_point = queue.entry_point->next_packet;
+        if (!queue.entry_point) 
+        { 
+            queue.exit_point = NULL;
         }
-
-        atomic_fetch_sub(&dataStream.streamVolume, 1);
-        atomic_fetch_add(&dataStream.processedPackets, 1);
-
+        atomic_fetch_sub(&queue.size, 1);
+        atomic_fetch_add(&queue.visited, 1);
         free(packet);
-        mtx_unlock(&dataStream.streamLock);
+        mtx_unlock(&queue.stream_lock);
         return true;
     }
     return false;
 }
 
-size_t size(void) {
-    // Reports the current volume of data in the stream.
-    return atomic_load(&dataStream.streamVolume);
+// and now, for the easy part of the assignment:
+size_t size(void) 
+{
+    return atomic_load(&queue.size);
 }
-
-size_t waiting(void) {
-    // Lists the number of processors in idle state.
-    return atomic_load(&dataStream.idleProcessors);
+size_t visited(void) 
+{
+    return atomic_load(&queue.visited);
 }
-
-size_t visited(void) {
-    // Counts the packets processed over time.
-    return atomic_load(&dataStream.processedPackets);
+size_t waiting(void) 
+{
+    return atomic_load(&queue.waiting);
 }
