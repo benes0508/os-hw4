@@ -15,6 +15,8 @@ typedef struct {
     Node* tail;
     atomic_size_t waiting;
     atomic_size_t visited;
+    atomic_size_t ticket_issue;  // Ticket issuer for waiting threads
+    atomic_size_t ticket_serve;  // Ticket counter for the queue service
 } ConcurrentQueue;
 
 ConcurrentQueue queue;
@@ -26,6 +28,8 @@ void initQueue(void) {
     cnd_init(&queue.has_items);
     atomic_store(&queue.waiting, 0);
     atomic_store(&queue.visited, 0);
+    atomic_store(&queue.ticket_issue, 0);
+    atomic_store(&queue.ticket_serve, 0);
 }
 
 void destroyQueue(void) {
@@ -57,17 +61,16 @@ void enqueue(void* item) {
     }
     queue.tail = newNode;
 
-    cnd_signal(&queue.has_items);
+    cnd_broadcast(&queue.has_items);  // Wake all, but only the right ticket proceeds
     mtx_unlock(&queue.lock);
 }
 
 void* dequeue(void) {
     mtx_lock(&queue.lock);
 
-    while (!queue.head) {
-        atomic_fetch_add(&queue.waiting, 1);
+    size_t my_ticket = atomic_fetch_add(&queue.ticket_issue, 1);
+    while (!queue.head || my_ticket != atomic_load(&queue.ticket_serve)) {
         cnd_wait(&queue.has_items, &queue.lock);
-        atomic_fetch_sub(&queue.waiting, 1);
     }
 
     Node* node = queue.head;
@@ -80,6 +83,8 @@ void* dequeue(void) {
 
     free(node);
     atomic_fetch_add(&queue.visited, 1);
+    atomic_fetch_add(&queue.ticket_serve, 1);  // Next ticket
+    cnd_broadcast(&queue.has_items);  // Next ticket can proceed
 
     mtx_unlock(&queue.lock);
     return item;
@@ -90,7 +95,7 @@ bool tryDequeue(void** item) {
         return false;
     }
 
-    if (!queue.head) {
+    if (!queue.head || atomic_load(&queue.ticket_serve) != atomic_load(&queue.ticket_issue)) {
         mtx_unlock(&queue.lock);
         return false;
     }
@@ -105,6 +110,8 @@ bool tryDequeue(void** item) {
 
     free(node);
     atomic_fetch_add(&queue.visited, 1);
+    atomic_fetch_add(&queue.ticket_serve, 1);  // Next ticket
+    cnd_broadcast(&queue.has_items);
 
     mtx_unlock(&queue.lock);
     return true;
