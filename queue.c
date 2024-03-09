@@ -74,11 +74,11 @@ void* dequeue(void) {
         queue.tail = NULL;
     }
     void* item = node->data;
-    free(node);
     atomic_fetch_sub(&queue.size, 1);
     atomic_fetch_add(&queue.visited, 1);
     cnd_signal(&queue.not_empty); // Signal other waiting threads
     mtx_unlock(&queue.lock);
+    free(node); // Free the node after unlocking the mutex
     return item;
 }
 
