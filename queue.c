@@ -1,124 +1,146 @@
+#include <stdio.h>
 #include <stdlib.h>
-#include <stdbool.h>
 #include <threads.h>
 #include <stdatomic.h>
+#include <stdbool.h>
+#include <unistd.h>
+#include <assert.h>
 
-typedef struct Node {
-    void* data;
-    struct Node* next;
-} Node;
+// Represents each item in the queue.
+typedef struct ItemNode {
+    void* payload; // The data stored in this node.
+    struct ItemNode* next; // Pointer to the next node in the queue.
+} ItemNode;
 
+// Manages threads that are waiting for the queue to have items.
+typedef struct ThreadWaitNode {
+    cnd_t waitCondition; // Condition variable for waiting.
+    struct ThreadWaitNode* next; // Next thread in the waiting list.
+} ThreadWaitNode;
+
+// The main structure for the queue, renamed for clarity.
 typedef struct {
-    Node* head;
-    Node* tail;
-    mtx_t lock;
-    cnd_t not_empty;
-    atomic_size_t size;
-    atomic_size_t visited;
-    atomic_size_t waiting;  // To keep track of the waiting threads.
-} ConcurrentQueue;
+    ItemNode* front; // Start of the queue.
+    ItemNode* rear; // End of the queue.
+    mtx_t syncLock; // Mutex for synchronizing access to the queue.
+    cnd_t itemAvailable; // Condition variable for when the queue is not empty.
+    atomic_size_t itemCount; // Current count of items in the queue.
+    atomic_size_t waitingCount; // Number of threads waiting for an item.
+    atomic_size_t processedCount; // Count of items processed through the queue.
+    ThreadWaitNode* waitListFront; // Start of the waiting threads list.
+    ThreadWaitNode* waitListRear; // End of the waiting threads list.
+    mtx_t waitListLock; // Mutex for synchronizing access to the waiting threads list.
+} SyncQueue;
 
-ConcurrentQueue queue;
+SyncQueue myQueue;
 
 void initQueue(void) {
-    queue.head = NULL;
-    queue.tail = NULL;
-    mtx_init(&queue.lock, mtx_plain);
-    cnd_init(&queue.not_empty);
-    atomic_store(&queue.size, 0);
-    atomic_store(&queue.visited, 0);
-    atomic_store(&queue.waiting, 0);  // Initialize waiting count.
+    myQueue.front = myQueue.rear = NULL;
+    mtx_init(&myQueue.syncLock, mtx_plain);
+    cnd_init(&myQueue.itemAvailable);
+    atomic_store(&myQueue.itemCount, 0);
+    atomic_store(&myQueue.waitingCount, 0);
+    atomic_store(&myQueue.processedCount, 0);
+    myQueue.waitListFront = myQueue.waitListRear = NULL;
+    mtx_init(&myQueue.waitListLock, mtx_plain);
 }
 
 void destroyQueue(void) {
-    Node* current;
-    mtx_lock(&queue.lock);
-    while ((current = queue.head) != NULL) {
-        queue.head = current->next;
-        free(current);
+    ItemNode* currentNode = myQueue.front;
+    while (currentNode) {
+        ItemNode* toFree = currentNode;
+        currentNode = currentNode->next;
+        free(toFree);
     }
-    queue.tail = NULL;
-    mtx_unlock(&queue.lock);
-    mtx_destroy(&queue.lock);
-    cnd_destroy(&queue.not_empty);
+    
+    ThreadWaitNode* currentWaitNode = myQueue.waitListFront;
+    while (currentWaitNode) {
+        ThreadWaitNode* toFree = currentWaitNode;
+        currentWaitNode = currentWaitNode->next;
+        cnd_destroy(&toFree->waitCondition);
+        free(toFree);
+    }
+
+    mtx_destroy(&myQueue.syncLock);
+    cnd_destroy(&myQueue.itemAvailable);
+    mtx_destroy(&myQueue.waitListLock);
 }
 
-void enqueue(void* item) {
-    Node* newNode = malloc(sizeof(Node));
-    newNode->data = item;
+void enqueue(void* data) {
+    ItemNode* newNode = malloc(sizeof(ItemNode));
+    newNode->payload = data;
     newNode->next = NULL;
 
-    mtx_lock(&queue.lock);
-    if (queue.tail) {
-        queue.tail->next = newNode;
+    mtx_lock(&myQueue.syncLock);
+
+    if (myQueue.rear == NULL) {
+        myQueue.front = myQueue.rear = newNode;
     } else {
-        queue.head = newNode;
+        myQueue.rear->next = newNode;
+        myQueue.rear = newNode;
     }
-    queue.tail = newNode;
-    atomic_fetch_add(&queue.size, 1);
-    if (atomic_load(&queue.waiting) > 0) {
-        cnd_signal(&queue.not_empty);
-    }
-    mtx_unlock(&queue.lock);
+
+    atomic_fetch_add(&myQueue.itemCount, 1);
+    cnd_signal(&myQueue.itemAvailable);
+
+    mtx_unlock(&myQueue.syncLock);
 }
-
-
 
 void* dequeue(void) {
-    mtx_lock(&queue.lock);
-    while (!queue.head) {
-        atomic_fetch_add(&queue.waiting, 1);
-        cnd_wait(&queue.not_empty, &queue.lock);
-        atomic_fetch_sub(&queue.waiting, 1);
+    mtx_lock(&myQueue.syncLock);
+
+    while (myQueue.front == NULL) {
+        cnd_wait(&myQueue.itemAvailable, &myQueue.syncLock);
     }
-    Node* node = queue.head;
-    void* item = node->data;
-    queue.head = node->next;
-    if (!queue.head) {
-        queue.tail = NULL;
+
+    ItemNode* tempNode = myQueue.front;
+    void* data = tempNode->payload;
+    myQueue.front = myQueue.front->next;
+    if (myQueue.front == NULL) {
+        myQueue.rear = NULL;
     }
-    atomic_fetch_sub(&queue.size, 1);
-    atomic_fetch_add(&queue.visited, 1);
-    if (atomic_load(&queue.waiting) > 0) {
-        cnd_signal(&queue.not_empty);
-    }
-    mtx_unlock(&queue.lock);
-    free(node); // Free the node after unlocking the mutex
-    return item;
+
+    atomic_fetch_sub(&myQueue.itemCount, 1);
+    atomic_fetch_add(&myQueue.processedCount, 1);
+
+    free(tempNode);
+
+    mtx_unlock(&myQueue.syncLock);
+    return data;
 }
 
+bool tryDequeue(void** data) {
+    if (mtx_trylock(&myQueue.syncLock) == thrd_success) {
+        if (myQueue.front == NULL) {
+            mtx_unlock(&myQueue.syncLock);
+            return false;
+        }
 
+        ItemNode* tempNode = myQueue.front;
+        *data = tempNode->payload;
+        myQueue.front = myQueue.front->next;
+        if (myQueue.front == NULL) {
+            myQueue.rear = NULL;
+        }
 
+        atomic_fetch_sub(&myQueue.itemCount, 1);
+        atomic_fetch_add(&myQueue.processedCount, 1);
 
-bool tryDequeue(void** item) {
-    if (mtx_trylock(&queue.lock) != thrd_success) {
-        return false;
+        free(tempNode);
+        mtx_unlock(&myQueue.syncLock);
+        return true;
     }
-    if (!queue.head) {
-        mtx_unlock(&queue.lock);
-        return false;
-    }
-    Node* node = queue.head;
-    queue.head = node->next;
-    if (!queue.head) {
-        queue.tail = NULL;
-    }
-    *item = node->data;
-    free(node);
-    atomic_fetch_sub(&queue.size, 1);
-    atomic_fetch_add(&queue.visited, 1);
-    mtx_unlock(&queue.lock);
-    return true;
+    return false;
 }
 
 size_t size(void) {
-    return atomic_load(&queue.size);
+    return atomic_load(&myQueue.itemCount);
 }
 
 size_t waiting(void) {
-    return atomic_load(&queue.waiting);
+    return atomic_load(&myQueue.waitingCount);
 }
 
 size_t visited(void) {
-    return atomic_load(&queue.visited);
+    return atomic_load(&myQueue.processedCount);
 }
