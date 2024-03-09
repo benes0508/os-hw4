@@ -136,3 +136,42 @@ void* dequeue(void) {
     mtx_unlock(&queue.lock);
     return item;
 }
+
+// The rest of your functions (tryDequeue, size, waiting, visited) remain the same.
+
+bool tryDequeue(void** item) {
+    if (mtx_trylock(&queue.lock) != thrd_success) {
+        return false;
+    }
+
+    if (!queue.head) {
+        mtx_unlock(&queue.lock);
+        return false;
+    }
+
+    Node* node = queue.head;
+    queue.head = node->next;
+    if (!queue.head) {
+        queue.tail = NULL;
+    }
+
+    *item = node->data;
+    free(node);
+    atomic_fetch_sub(&queue.size, 1);
+    atomic_fetch_add(&queue.visited, 1);
+
+    mtx_unlock(&queue.lock);
+    return true;
+}
+
+size_t size(void) {
+    return atomic_load(&queue.size);
+}
+
+size_t waiting(void) {
+    return atomic_load(&queue.waiting);
+}
+
+size_t visited(void) {
+    return atomic_load(&queue.visited);
+}
