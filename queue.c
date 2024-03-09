@@ -62,6 +62,7 @@ void enqueue(void* item) {
     mtx_unlock(&queue.lock);
 }
 
+
 void* dequeue(void) {
     mtx_lock(&queue.lock);
     while (!queue.head) {
@@ -77,7 +78,9 @@ void* dequeue(void) {
     }
     atomic_fetch_sub(&queue.size, 1);
     atomic_fetch_add(&queue.visited, 1);
-    cnd_signal(&queue.not_empty); // Signal other waiting threads
+    if (atomic_load(&queue.waiting) > 0) {
+        cnd_signal(&queue.not_empty);
+    }
     mtx_unlock(&queue.lock);
     free(node); // Free the node after unlocking the mutex
     return item;
