@@ -138,26 +138,28 @@ void* dequeue(void) {
 }
 
 // The rest of your functions (tryDequeue, size, waiting, visited) remain the same.
-
 bool tryDequeue(void** item) {
-    if (mtx_trylock(&queue.lock) != thrd_success) {
-        return false;
-    }
+    mtx_lock(&queue.lock);
 
-    if (!queue.head) {
+    // Adjusted to reference the queue.items.head instead of queue.head
+    if (!queue.items.head) {
         mtx_unlock(&queue.lock);
         return false;
     }
 
-    Node* node = queue.head;
-    queue.head = node->next;
-    if (!queue.head) {
-        queue.tail = NULL;
+    // Adjusted to reference the queue.items.head instead of queue.head
+    Node* node = queue.items.head;
+    queue.items.head = node->next;
+    
+    // Adjusted to reference the queue.items.head and queue.items.tail
+    if (!queue.items.head) {
+        queue.items.tail = NULL;
     }
 
     *item = node->data;
     free(node);
-    atomic_fetch_sub(&queue.size, 1);
+    
+    // This line does not need to adjust because visited is not encapsulated.
     atomic_fetch_add(&queue.visited, 1);
 
     mtx_unlock(&queue.lock);
@@ -165,8 +167,18 @@ bool tryDequeue(void** item) {
 }
 
 size_t size(void) {
-    return atomic_load(&queue.size);
+    // Adjusted to reference the correct item count
+    size_t count = 0;
+    mtx_lock(&queue.lock);
+    Node* current = queue.items.head;
+    while (current) {
+        count++;
+        current = current->next;
+    }
+    mtx_unlock(&queue.lock);
+    return count;
 }
+
 
 size_t waiting(void) {
     return atomic_load(&queue.waiting);
